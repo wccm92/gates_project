@@ -204,6 +204,16 @@ Para agregar molinetes, solo se añade una entrada nueva con su id, ip y credenc
 Con Docker (recomendado):
 ```cmd
 docker-compose up -d
+
+db:
+    image: "postgres"
+    container_name: "fua-db"
+    environment:
+      - POSTGRES_DB=fua_db
+      - POSTGRES_USER=gates_user
+      - POSTGRES_PASSWORD=gates_password
+    ports:
+      - "5432:5432"
 ```
 
 O creando la BD manualmente si ya tienes PostgreSQL instalado:
