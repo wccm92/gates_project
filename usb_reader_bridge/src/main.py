@@ -1,6 +1,13 @@
 import logging
 import signal
 import sys
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent.parent / '.env')
+except ImportError:
+    pass
 
 from config import Config
 from readers import build_reader
