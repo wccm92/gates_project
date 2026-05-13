@@ -1,3 +1,15 @@
 spring:
   application:
     name: ms-gates
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:edc}
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:postgres}
+    driver-class-name: org.postgresql.Driver
+
+app:
+  access:
+    http:
+      base-url: ${ACCESS_BASE_URL:http://localhost:8080}
+      path: ${ACCESS_PATH:/api/access}
+      timeout-seconds: ${ACCESS_TIMEOUT_SECONDS:5}

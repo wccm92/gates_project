@@ -20,17 +20,19 @@ public class ProcessReadingUseCase {
         this.publisher = publisher;
     }
 
-    public void handle(RawReading raw) {
+    public Optional<Credential> handle(RawReading raw) {
         try {
             Optional<Credential> credential = parser.parse(raw);
             if (credential.isEmpty()) {
                 log.warn("Discarded reading: no numeric attribute of 5+ digits found [length={}]",
                         raw.payload().length());
-                return;
+                return Optional.empty();
             }
             publisher.publish(credential.get());
+            return credential;
         } catch (RuntimeException e) {
             log.error("Unexpected failure while processing reading", e);
+            return Optional.empty();
         }
     }
 }

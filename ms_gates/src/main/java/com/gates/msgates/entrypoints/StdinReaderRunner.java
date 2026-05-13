@@ -1,6 +1,8 @@
 package com.gates.msgates.entrypoints;
 
+import com.gates.msgates.domain.exception.BusinessException;
 import com.gates.msgates.domain.model.RawReading;
+import com.gates.msgates.domain.usecase.CheckAccessUseCase;
 import com.gates.msgates.domain.usecase.ProcessReadingUseCase;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
@@ -23,14 +25,17 @@ public class StdinReaderRunner implements ApplicationRunner {
     private static final Logger log = LoggerFactory.getLogger(StdinReaderRunner.class);
     private static final int MAX_LINE_LENGTH = 1024;
 
-    private final ProcessReadingUseCase useCase;
+    private final ProcessReadingUseCase processReadingUseCase;
+    private final CheckAccessUseCase checkAccessUseCase;
     private final ConfigurableApplicationContext applicationContext;
     private final Thread readerThread;
     private volatile boolean running = true;
 
-    public StdinReaderRunner(ProcessReadingUseCase useCase,
+    public StdinReaderRunner(ProcessReadingUseCase processReadingUseCase,
+                             CheckAccessUseCase checkAccessUseCase,
                              ConfigurableApplicationContext applicationContext) {
-        this.useCase = useCase;
+        this.processReadingUseCase = processReadingUseCase;
+        this.checkAccessUseCase = checkAccessUseCase;
         this.applicationContext = applicationContext;
         this.readerThread = new Thread(this::readLoop, "stdin-reader");
         this.readerThread.setDaemon(true);
@@ -71,7 +76,15 @@ public class StdinReaderRunner implements ApplicationRunner {
             return;
         }
         log.debug("Received line [length={}]", line.length());
-        useCase.handle(new RawReading(line, Instant.now()));
+        processReadingUseCase.handle(new RawReading(line, Instant.now()))
+                .ifPresent(credential -> {
+                    try {
+                        checkAccessUseCase.handle(credential);
+                    } catch (BusinessException e) {
+                        log.debug("Business rule rejected credential={} code={} message={}",
+                                credential.value(), e.getCode(), e.getMessage());
+                    }
+                });
     }
 
     private void requestShutdown() {
