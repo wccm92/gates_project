@@ -1,6 +1,6 @@
 # ms-gates
 
-Java microservice that powers turnstile access control. Phase 1 reads pipe-delimited scans from a physical USB reader over `stdin`, extracts the numeric credential (≥5 digits) from one of the attributes, and prints it.
+Java microservice that powers turnstile access control. Reads pipe-delimited scans from a physical USB reader over `stdin`, extracts the numeric credential (≥5 digits), validates it against a PostgreSQL database, and notifies an external system via HTTP when access is granted.
 
 ---
 
@@ -9,6 +9,7 @@ Java microservice that powers turnstile access control. Phase 1 reads pipe-delim
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
 - [Build](#build)
+- [Configuration](#configuration)
 - [Run](#run)
 - [Testing guide](#testing-guide)
   - [Level 1 — Sanity check](#level-1--sanity-check-does-the-context-start)
@@ -19,6 +20,7 @@ Java microservice that powers turnstile access control. Phase 1 reads pipe-delim
   - [Level 6 — Real USB reader](#level-6--real-usb-reader)
 - [Log reference](#log-reference)
 - [Input contract](#input-contract)
+- [Database contract](#database-contract)
 - [Production deployment notes](#production-deployment-notes)
 
 ---
@@ -29,32 +31,51 @@ Clean / hexagonal layering. The microservice does **not** know it is talking to 
 
 ```
 ┌─────────────────────┐     ┌──────────────────────┐     ┌────────────────────┐
-│ USB Reader hardware │ ──▶ │ OS wrapper (cat /    │ ──▶ │ Java microservice  │
-│ (HID or serial CDC) │     │ dev/ttyUSB0 | ...)   │     │ reads System.in    │
+│ USB Reader hardware │ ──▶ │ OS wrapper / Python   │ ──▶ │ Java microservice  │
+│ (HID or serial CDC) │     │ HID bridge            │     │ reads System.in    │
 └─────────────────────┘     └──────────────────────┘     └────────────────────┘
-         supervised by launchd / systemd (auto-start, auto-restart on crash)
+         supervised by systemd (auto-start, auto-restart on crash)
+
+                                         ┌──────────────────┐
+                           DB lookup ──▶ │  PostgreSQL       │
+                                         │  (invitados)      │
+                                         └──────────────────┘
+
+                                         ┌──────────────────┐
+                       HTTP notify  ──▶  │  External system  │
+                                         │  POST /api/access │
+                                         └──────────────────┘
 ```
 
 ### Package layout
 
 ```
 src/main/java/com/gates/msgates/
-├── MsGatesApplication.java                    Spring Boot entry point
+├── MsGatesApplication.java                       Spring Boot entry point
 ├── config/
-│   └── BeanConfiguration.java                 wires domain beans
-├── domain/                                    framework-free
+│   ├── BeanConfiguration.java                    wires domain beans
+│   └── AccessHttpProperties.java                 typed config for HTTP notifier
+├── domain/                                       framework-free
 │   ├── model/
-│   │   ├── RawReading.java                    record: payload + receivedAt
-│   │   └── Credential.java                    record: validated numeric (≥5 digits)
+│   │   ├── RawReading.java                       record: payload + receivedAt
+│   │   ├── Credential.java                       record: validated numeric (≥5 digits)
+│   │   └── Visitante.java                        record: maps invitados table row
+│   ├── exception/
+│   │   └── BusinessException.java                domain business error with code
 │   └── usecase/
-│       ├── ReadingParser.java                 pure parser
-│       ├── ProcessReadingUseCase.java         orchestration
+│       ├── ReadingParser.java                    pure parser
+│       ├── ProcessReadingUseCase.java            extracts credential, publishes to stdout
+│       ├── CheckAccessUseCase.java               validates credential and notifies
 │       └── port/
-│           └── CredentialPublisherPort.java   output port
+│           ├── CredentialPublisherPort.java      output port: stdout
+│           ├── VisitorRepositoryPort.java        output port: DB lookup
+│           └── AccessNotifierPort.java           output port: HTTP notification
 ├── adapters/
-│   └── ConsoleCredentialPublisher.java        prints credential to stdout
+│   ├── ConsoleCredentialPublisher.java           prints credential to stdout
+│   ├── JdbcVisitorRepository.java               PostgreSQL adapter (invitados table)
+│   └── HttpAccessNotifier.java                  HTTP POST adapter
 └── entrypoints/
-    └── StdinReaderRunner.java                 daemon reader thread
+    └── StdinReaderRunner.java                    daemon reader thread
 ```
 
 `domain/*` has zero Spring annotations. Only `adapters/` and `entrypoints/` touch the framework. Beans are wired in `config/BeanConfiguration.java`.
@@ -65,10 +86,18 @@ src/main/java/com/gates/msgates/
 2. The thread loops `BufferedReader.readLine()` on UTF-8 `System.in`.
 3. Each non-blank line ≤1 KiB becomes a `RawReading(payload, Instant.now())`.
 4. `ProcessReadingUseCase` calls `ReadingParser`, which splits on `|` and finds the first token containing `\d{5,}`.
-5. On hit → `ConsoleCredentialPublisher.publish()` logs `INFO` and prints the numeric to stdout.
+5. On hit → `ConsoleCredentialPublisher.publish()` logs `INFO` and prints the numeric to stdout. Returns `Optional<Credential>`.
 6. On miss → `WARN` log, reading dropped, loop continues.
-7. Any `RuntimeException` is caught and logged — the reader thread is never killed by bad data.
-8. On EOF or `IOException` → `SpringApplication.exit()` so the process supervisor can restart it.
+7. If a credential was extracted, `CheckAccessUseCase.handle()` runs:
+   - Queries `invitados` by `id_visitante`.
+   - Not found → logs `[E001]`, throws `BusinessException("documento no presente")`.
+   - Found, `estado` non-blank → logs `[E002]`, throws `BusinessException("documento ya ingresó")`.
+   - Found, `estado` null/blank → logs `[S000]`, calls `HttpAccessNotifier` with `{"doc":"<value>"}`.
+     - HTTP 200 → logs `[S001]`.
+     - HTTP non-200 → logs `[E003]`.
+8. `BusinessException` is caught at the entrypoint — the reader loop is never interrupted.
+9. Any unexpected `RuntimeException` inside the use case is caught and logged as `[E004]`.
+10. On EOF or `IOException` → `SpringApplication.exit()` so the process supervisor can restart it.
 
 ---
 
@@ -76,6 +105,7 @@ src/main/java/com/gates/msgates/
 
 - **JDK 20 or later** (Corretto 21 verified).
 - **Maven 3.9+** (or use IntelliJ's bundled Maven).
+- **PostgreSQL** accessible from the machine running the service.
 
 Install Maven on macOS:
 
@@ -95,6 +125,64 @@ mvn clean package -DskipTests
 ```
 
 Produces `target/ms-gates-0.0.1-SNAPSHOT.jar`.
+
+---
+
+## Configuration
+
+All values are read from environment variables. Defaults are shown and apply when the variable is absent (useful for local development).
+
+### Environment variables
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `DB_HOST` | `localhost` | PostgreSQL host |
+| `DB_PORT` | `5432` | PostgreSQL port |
+| `DB_NAME` | `edc` | Database name |
+| `DB_USERNAME` | `postgres` | Database user |
+| `DB_PASSWORD` | `postgres` | Database password |
+| `ACCESS_BASE_URL` | `http://localhost:8080` | Base URL of the HTTP access notification endpoint |
+| `ACCESS_PATH` | `/api/access` | Path for the HTTP POST request |
+| `ACCESS_TIMEOUT_SECONDS` | `5` | HTTP client timeout in seconds |
+
+### Systemd deployment (Linux)
+
+The service is supervised by systemd and configured via two `EnvironmentFile` entries — one for the Python USB bridge, one for the Java service:
+
+```ini
+EnvironmentFile=/etc/gates/bridge.env
+EnvironmentFile=/etc/gates/ms-gates.env
+```
+
+Create `/etc/gates/ms-gates.env`:
+
+```ini
+# PostgreSQL
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=edc
+DB_USERNAME=myuser
+DB_PASSWORD=secret
+
+# HTTP notifier
+ACCESS_BASE_URL=http://192.168.x.x:8080
+ACCESS_PATH=/api/access
+ACCESS_TIMEOUT_SECONDS=5
+```
+
+Lock down the file (contains credentials):
+
+```bash
+sudo chown root:gates /etc/gates/ms-gates.env
+sudo chmod 640 /etc/gates/ms-gates.env
+```
+
+### Overriding at runtime (dev/testing)
+
+```bash
+DB_PASSWORD=secret ACCESS_BASE_URL=http://localhost:9000 \
+  java -jar target/ms-gates-0.0.1-SNAPSHOT.jar
+```
 
 ---
 
@@ -144,6 +232,7 @@ Expected:
 
 - `INFO  ...ConsoleCredentialPublisher : Credential extracted: 12345678`
 - `12345678` printed on its own line (the `System.out.println` from the publisher).
+- `INFO  ...CheckAccessUseCase : [S000] documento apto para ingresar` (if credential exists in DB and estado is blank).
 
 `Ctrl+D` → clean shutdown via EOF. `Ctrl+C` → clean shutdown via SIGTERM.
 
@@ -164,12 +253,12 @@ BADGE-SCAN|USER|ABC123456|TURNSTILE-A
 EOF
 ```
 
-| Input                                         | Result                                                  |
-| --------------------------------------------- | ------------------------------------------------------- |
-| `EVENT\|CARD\|12345678\|DOOR-01`              | prints `12345678`, INFO log                             |
-| `EVENT\|CARD\|999\|DOOR-02`                   | no print, WARN "no numeric attribute of 5+ digits found" |
-| `\|\|\|`                                      | no print, WARN                                          |
-| `BADGE-SCAN\|USER\|ABC123456\|TURNSTILE-A`    | prints `123456` (extracted from inside `ABC123456`)     |
+| Input | Result |
+| --- | --- |
+| `EVENT\|CARD\|12345678\|DOOR-01` | prints `12345678`, then access check runs |
+| `EVENT\|CARD\|999\|DOOR-02` | no print, WARN "no numeric attribute of 5+ digits found" |
+| `\|\|\|` | no print, WARN |
+| `BADGE-SCAN\|USER\|ABC123456\|TURNSTILE-A` | prints `123456`, then access check runs |
 
 After the last line, EOF closes stdin, runner logs `stdin closed (EOF)` and Spring exits with code 0.
 
@@ -203,15 +292,13 @@ EOF
 java -jar target/ms-gates-0.0.1-SNAPSHOT.jar < fixtures/readings.txt
 ```
 
-Expected: four numeric lines printed (`12345678`, `87654321`, `55554444`, `99999999`), blank line silently skipped, the others produce WARN logs and are dropped. Process exits 0 at EOF.
-
-Keep this fixture in the repo — it becomes the base for future JUnit tests.
+Expected: four numeric lines printed (`12345678`, `87654321`, `55554444`, `99999999`), blank line silently skipped, the others produce WARN logs and are dropped. Each extracted credential then goes through the access check. Process exits 0 at EOF.
 
 ---
 
 ### Level 4 — Simulate a live reader with a FIFO
 
-Closest simulation of the real USB flow without hardware. A FIFO behaves exactly like the pipe that `cat /dev/tty.usbserial-X | java -jar …` creates.
+Closest simulation of the real USB flow without hardware. A FIFO behaves exactly like the pipe that the Python HID bridge creates.
 
 ```bash
 mkfifo /tmp/reader.fifo
@@ -231,7 +318,7 @@ sleep 1
 echo 'EVENT|CARD|87654321|DOOR-02' > /tmp/reader.fifo
 ```
 
-Terminal A prints each numeric as it arrives and keeps waiting — exactly the production behavior.
+Terminal A prints each numeric as it arrives, runs the access check, and keeps waiting — exactly the production behavior.
 
 **Test stream interruption** — close the writer side so Java sees EOF:
 
@@ -242,7 +329,7 @@ echo 'EVENT|CARD|55554444|DOOR-03' >&3
 exec 3>&-   # close FD 3 → Java sees EOF
 ```
 
-Terminal A logs `stdin closed (EOF), reader thread exiting` and the JVM exits 0. In production, `launchd`/`systemd` would restart it immediately.
+Terminal A logs `stdin closed (EOF), reader thread exiting` and the JVM exits 0. systemd restarts it immediately.
 
 **Cleanup:**
 
@@ -293,7 +380,7 @@ diff /tmp/before.txt /tmp/after.txt
 ```
 
 - **Diff shows `/dev/tty.usbserial-*` or `/dev/tty.usbmodem*`** → serial CDC (easy, Step 2a).
-- **No diff**, but scanning into TextEdit "types" characters → HID keyboard mode (needs a bridge, Step 2b).
+- **No diff**, but scanning into a text editor "types" characters → HID keyboard mode (needs a bridge, Step 2b).
 
 #### Step 2a — Serial-CDC reader
 
@@ -314,7 +401,7 @@ Common rates: 9600, 19200, 38400, 115200.
 
 #### Step 2b — HID keyboard-emulating reader
 
-`stdin` cannot see HID keyboard events directly (they go to the focused window). You need a small bridge process — typically ~15 lines of Python using `hidapi` — that reads the HID interface and writes one scan per line to stdout. Pipe that bridge into the Java process the same way as Step 2a.
+`stdin` cannot see HID keyboard events directly (they go to the focused window). A Python HID bridge process reads the USB HID interface and writes one scan per line to stdout. Pipe that bridge into the Java process the same way as Step 2a.
 
 ---
 
@@ -334,41 +421,115 @@ logging:
     com.gates.msgates: DEBUG
 ```
 
-| Level   | Message                                          | Meaning                                           |
-| ------- | ------------------------------------------------ | ------------------------------------------------- |
-| `INFO`  | `Starting stdin reader thread`                   | runner wired correctly                            |
-| `DEBUG` | `Received line [length=…]`                       | reader is flowing                                 |
-| `INFO`  | `Credential extracted: …`                        | happy path                                        |
-| `WARN`  | `Discarded reading: no numeric attribute…`       | parser couldn't find `\d{5,}`                     |
-| `WARN`  | `Dropping oversized line`                        | defensive 1 KiB cap hit                           |
-| `ERROR` | `Unexpected failure while processing reading`    | bug — should not happen with current code         |
-| `ERROR` | `stdin read failed…`                             | IO death — let supervisor restart                 |
-| `INFO`  | `stdin closed (EOF)…`                            | clean end — wrapper closed or `Ctrl+D`            |
+### Stdin reader & parser
+
+| Level | Message | Meaning |
+| --- | --- | --- |
+| `INFO` | `Starting stdin reader thread` | runner wired correctly |
+| `DEBUG` | `Received line [length=…]` | reader is flowing |
+| `INFO` | `Credential extracted: …` | credential parsed and printed to stdout |
+| `WARN` | `Discarded reading: no numeric attribute…` | parser couldn't find `\d{5,}` |
+| `WARN` | `Dropping oversized line` | defensive 1 KiB cap hit |
+| `ERROR` | `Unexpected failure while processing reading` | unexpected bug in parse/publish path |
+| `ERROR` | `stdin read failed…` | IO death — supervisor will restart |
+| `INFO` | `stdin closed (EOF)…` | clean end — bridge closed or `Ctrl+D` |
+
+### Access check
+
+| Code | Level | Message | Meaning |
+| --- | --- | --- | --- |
+| `S000` | `INFO` | `documento apto para ingresar` | credential found in DB, estado blank — HTTP notification about to be sent |
+| `S001` | `INFO` | `notificación HTTP exitosa` | external system responded 200 |
+| `E001` | `WARN` | `documento no presente` | credential not found in `invitados` table |
+| `E002` | `WARN` | `documento ya ingresó` | credential found but `estado` is non-blank (already admitted) |
+| `E003` | `ERROR` | `notificación HTTP fallida` | external system responded non-200 |
+| `E004` | `ERROR` | `error inesperado en verificación de acceso` | unexpected runtime exception in access check |
 
 ---
 
 ## Input contract
 
-| Concern            | Value                                        |
-| ------------------ | -------------------------------------------- |
-| Encoding           | UTF-8                                        |
-| Record separator   | `\n` (or `\r\n`, handled by `readLine()`)    |
-| Field separator    | `\|`                                         |
-| One reading per    | line                                         |
-| Trailing fields    | allowed                                      |
-| Max line length    | 1 KiB (oversize dropped with WARN)           |
-| Malformed lines    | tolerated, logged, dropped                   |
+| Concern | Value |
+| --- | --- |
+| Encoding | UTF-8 |
+| Record separator | `\n` (or `\r\n`, handled by `readLine()`) |
+| Field separator | `\|` |
+| One reading per | line |
+| Trailing fields | allowed |
+| Max line length | 1 KiB (oversize dropped with WARN) |
+| Malformed lines | tolerated, logged, dropped |
 
 Extraction rule: the parser returns the first `\d{5,}` **subsequence** found inside any pipe-delimited token (via `Matcher.find()`). So `CARD-ID:12345678` yields `12345678`.
 
 ---
 
+## Database contract
+
+Table: `invitados`
+
+```sql
+CREATE TABLE IF NOT EXISTS invitados (
+    id_visitante  TEXT         NOT NULL,
+    id_evento     INTEGER      NOT NULL,
+    id_suite      TEXT         NOT NULL,
+    estado        CHARACTER(1),
+    obsingreso    CHARACTER(50),
+    CONSTRAINT visitantexevento_pkey PRIMARY KEY (id_visitante, id_evento)
+);
+```
+
+The service queries by `id_visitante`, ordering by `id_evento DESC` and taking the most recent record (`LIMIT 1`).
+
+`estado` semantics:
+
+| Value | Meaning |
+| --- | --- |
+| `NULL` or blank (space-padded) | Visitor not yet admitted — access allowed |
+| Any non-blank character | Visitor already admitted — access denied (`[E002]`) |
+
+---
+
 ## Production deployment notes
 
-The process is intentionally short-lived on error — EOF or `IOException` triggers `SpringApplication.exit()`. Supervise it so unplug/replug cycles auto-recover:
+The process is intentionally short-lived on error — EOF or `IOException` triggers `SpringApplication.exit()`. The systemd unit supervises the full pipeline (Python HID bridge → Java service) with `Restart=always`.
 
-**macOS — `launchd`:** create `~/Library/LaunchAgents/com.gates.msgates.plist` with `KeepAlive=true` and a `ProgramArguments` entry that runs a shell wrapper piping the device into the jar.
+### systemd unit example
 
-**Linux — `systemd`:** create `/etc/systemd/system/ms-gates.service` with `Restart=always` and `ExecStart=/bin/sh -c 'stdbuf -oL cat /dev/ttyUSB0 | java -jar /opt/ms-gates/ms-gates.jar'`.
+```ini
+[Unit]
+Description=Gates Access Control Pipeline (USB bridge + microservice)
+After=network.target
 
-Neither the Java code nor its configuration changes between dev and prod — only the wrapper around `stdin` does.
+[Service]
+Type=simple
+User=gates
+WorkingDirectory=/opt/usb_reader_bridge
+ExecStart=/bin/sh -c '.venv/bin/python3 -u src/main.py | java -jar /opt/ms-gates/ms-gates.jar'
+Restart=always
+RestartSec=5
+EnvironmentFile=/etc/gates/bridge.env
+EnvironmentFile=/etc/gates/ms-gates.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+View live logs:
+
+```bash
+sudo journalctl -u gates-pipeline -f
+```
+
+### Environment files
+
+- `/etc/gates/bridge.env` — Python HID bridge variables (USB VID/PID, log level, reader mode).
+- `/etc/gates/ms-gates.env` — Java service variables (DB credentials, HTTP endpoint). See [Configuration](#configuration).
+
+Permissions for the credentials file:
+
+```bash
+sudo chown root:gates /etc/gates/ms-gates.env
+sudo chmod 640 /etc/gates/ms-gates.env
+```
