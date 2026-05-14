@@ -46,6 +46,14 @@ public class CheckAccessUseCase {
             if (statusCode == 200) {
                 log.info("[S001] notificación HTTP exitosa — credential={}, status={}",
                         credential.value(), statusCode);
+                try {
+                    repository.updateEstado(visitante, "1");
+                    log.info("[S002] estado actualizado a '1' en DB — credential={}",
+                            credential.value());
+                } catch (RuntimeException e) {
+                    log.error("[E005] error al actualizar estado en DB — credential={}",
+                            credential.value(), e);
+                }
             } else {
                 log.error("[E003] notificación HTTP fallida — credential={}, status={}",
                         credential.value(), statusCode);

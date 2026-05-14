@@ -440,10 +440,12 @@ logging:
 | --- | --- | --- | --- |
 | `S000` | `INFO` | `documento apto para ingresar` | credential found in DB, estado blank — HTTP notification about to be sent |
 | `S001` | `INFO` | `notificación HTTP exitosa` | external system responded 200 |
+| `S002` | `INFO` | `estado actualizado a '1' en DB` | DB record updated successfully after admission |
 | `E001` | `WARN` | `documento no presente` | credential not found in `invitados` table |
 | `E002` | `WARN` | `documento ya ingresó` | credential found but `estado` is non-blank (already admitted) |
 | `E003` | `ERROR` | `notificación HTTP fallida` | external system responded non-200 |
 | `E004` | `ERROR` | `error inesperado en verificación de acceso` | unexpected runtime exception in access check |
+| `E005` | `ERROR` | `error al actualizar estado en DB` | HTTP was 200 but the DB update failed |
 
 ---
 

@@ -19,6 +19,10 @@ public class JdbcVisitorRepository implements VisitorRepositoryPort {
             "ORDER BY id_evento DESC " +
             "LIMIT 1";
 
+    private static final String UPDATE =
+            "UPDATE invitados SET estado = ? " +
+            "WHERE id_visitante = ? AND id_evento = ?";
+
     private final JdbcTemplate jdbc;
 
     public JdbcVisitorRepository(JdbcTemplate jdbc) {
@@ -37,5 +41,10 @@ public class JdbcVisitorRepository implements VisitorRepositoryPort {
                         rs.getString("obsingreso")),
                 credential.value());
         return results.isEmpty() ? Optional.empty() : Optional.of(results.get(0));
+    }
+
+    @Override
+    public void updateEstado(Visitante visitante, String estado) {
+        jdbc.update(UPDATE, estado, visitante.idVisitante(), visitante.idEvento());
     }
 }
