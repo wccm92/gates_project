@@ -7,6 +7,10 @@ Java microservice that powers turnstile access control. Reads pipe-delimited sca
 ## Table of contents
 
 - [Architecture](#architecture)
+  - [Hexagonal overview](#hexagonal-overview)
+  - [Dual-database strategy — Composite Adapter pattern](#dual-database-strategy--composite-adapter-pattern)
+  - [Package layout](#package-layout)
+  - [Runtime flow](#runtime-flow)
 - [Prerequisites](#prerequisites)
 - [Build](#build)
 - [Configuration](#configuration)
@@ -27,6 +31,8 @@ Java microservice that powers turnstile access control. Reads pipe-delimited sca
 
 ## Architecture
 
+### Hexagonal overview
+
 Clean / hexagonal layering. The microservice does **not** know it is talking to a USB reader — its only contract is "newline-terminated, pipe-delimited text on `stdin`". Hardware bridging lives in an OS-level wrapper.
 
 ```
@@ -36,10 +42,11 @@ Clean / hexagonal layering. The microservice does **not** know it is talking to 
 └─────────────────────┘     └──────────────────────┘     └────────────────────┘
          supervised by systemd (auto-start, auto-restart on crash)
 
-                                         ┌──────────────────┐
-                           DB lookup ──▶ │  PostgreSQL       │
-                                         │  (invitados)      │
-                                         └──────────────────┘
+                                         ┌──────────────────────────────────────┐
+                           DB lookup ──▶ │  CompositeVisitorRepository          │
+                           DB update     │  ├─ local  PostgreSQL  (critical)     │
+                                         │  └─ remote PostgreSQL  (best-effort) │
+                                         └──────────────────────────────────────┘
 
                                          ┌──────────────────┐
                        HTTP notify  ──▶  │  External system  │
@@ -47,14 +54,74 @@ Clean / hexagonal layering. The microservice does **not** know it is talking to 
                                          └──────────────────┘
 ```
 
+The domain use case (`CheckAccessUseCase`) is aware of **one** repository port. The fact that two physical databases exist is invisible to it — that is the job of the Composite Adapter described below.
+
+---
+
+### Dual-database strategy — Composite Adapter pattern
+
+The service must keep two independent PostgreSQL databases in sync: a **local** one (on the same machine) and a **remote** one (on the same private network). Naively, you might add a second port to the domain or make the use case call each database explicitly. Both approaches leak infrastructure topology into business logic.
+
+The chosen solution is the **Composite Adapter pattern**:
+
+```
+Domain use case
+      │
+      │  calls
+      ▼
+VisitorRepositoryPort          ← single output port, defined in the domain
+      │
+      │  implemented by
+      ▼
+CompositeVisitorRepository     ← adapter layer, invisible to the domain
+      │
+      ├── findByCredential ──────────▶ JdbcVisitorRepository       (local DB)
+      │
+      └── updateEstado ─────────────▶ JdbcVisitorRepository        (local DB)  ← critical
+                        └────────────▶ RemoteJdbcVisitorRepository  (remote DB) ← best-effort
+```
+
+**How it works:**
+
+- `CheckAccessUseCase` calls `visitorRepositoryPort.findByCredential()` and `visitorRepositoryPort.updateEstado()` — it is completely unaware of how many databases are behind the port.
+- `CompositeVisitorRepository` implements that single port and internally delegates to both concrete JDBC adapters.
+- **Reads** (`findByCredential`) go to the **local DB only** — the local database is the authoritative source for access decisions.
+- **Writes** (`updateEstado`) go to **both databases**, with different failure semantics:
+  - **Local DB** — treated as **critical**. If the update fails, the exception propagates to the use case, which logs `[E005]` and `[S002]` is not emitted.
+  - **Remote DB** — treated as **best-effort**. If the update fails, `CompositeVisitorRepository` catches the exception, logs `[E006]`, and does **not** re-throw. The use case proceeds normally and logs `[S002]`.
+
+**Why this design?**
+
+| Concern | Decision |
+| --- | --- |
+| Domain isolation | Use case never imports JDBC, knows nothing about local vs. remote |
+| Failure tolerance | A remote DB outage does not block admissions |
+| Extensibility | Adding a third database requires only a new adapter + one line in the composite; no domain change |
+| Testability | Each adapter can be unit-tested independently; the composite can be tested with mocks |
+
+**Key classes:**
+
+| Class | Package | Role |
+| --- | --- | --- |
+| `VisitorRepositoryPort` | `domain.usecase.port` | Output port — the only DB abstraction the domain sees |
+| `JdbcVisitorRepository` | `adapters` | Local PostgreSQL — `find` + `update` |
+| `RemoteJdbcVisitorRepository` | `adapters` | Remote PostgreSQL — `update` only |
+| `CompositeVisitorRepository` | `adapters` | Implements the port; routes calls to both adapters |
+
+The composition is wired entirely in `BeanConfiguration` — no Spring annotations in domain or adapter classes.
+
+---
+
 ### Package layout
 
 ```
 src/main/java/com/gates/msgates/
 ├── MsGatesApplication.java                       Spring Boot entry point
 ├── config/
-│   ├── BeanConfiguration.java                    wires domain beans
-│   └── AccessHttpProperties.java                 typed config for HTTP notifier
+│   ├── BeanConfiguration.java                    wires domain beans and infrastructure
+│   ├── AccessHttpProperties.java                 typed config for HTTP notifier
+│   ├── LocalDbProperties.java                    typed config for local PostgreSQL
+│   └── RemoteDbProperties.java                   typed config for remote PostgreSQL
 ├── domain/                                       framework-free
 │   ├── model/
 │   │   ├── RawReading.java                       record: payload + receivedAt
@@ -68,17 +135,21 @@ src/main/java/com/gates/msgates/
 │       ├── CheckAccessUseCase.java               validates credential and notifies
 │       └── port/
 │           ├── CredentialPublisherPort.java      output port: stdout
-│           ├── VisitorRepositoryPort.java        output port: DB lookup
+│           ├── VisitorRepositoryPort.java        output port: DB lookup + update
 │           └── AccessNotifierPort.java           output port: HTTP notification
 ├── adapters/
 │   ├── ConsoleCredentialPublisher.java           prints credential to stdout
-│   ├── JdbcVisitorRepository.java               PostgreSQL adapter (invitados table)
+│   ├── JdbcVisitorRepository.java               local PostgreSQL adapter (find + update)
+│   ├── RemoteJdbcVisitorRepository.java         remote PostgreSQL adapter (update only)
+│   ├── CompositeVisitorRepository.java          routes reads to local, writes to both
 │   └── HttpAccessNotifier.java                  HTTP POST adapter
 └── entrypoints/
     └── StdinReaderRunner.java                    daemon reader thread
 ```
 
 `domain/*` has zero Spring annotations. Only `adapters/` and `entrypoints/` touch the framework. Beans are wired in `config/BeanConfiguration.java`.
+
+---
 
 ### Runtime flow
 
@@ -89,12 +160,15 @@ src/main/java/com/gates/msgates/
 5. On hit → `ConsoleCredentialPublisher.publish()` logs `INFO` and prints the numeric to stdout. Returns `Optional<Credential>`.
 6. On miss → `WARN` log, reading dropped, loop continues.
 7. If a credential was extracted, `CheckAccessUseCase.handle()` runs:
-   - Queries `invitados` by `id_visitante`.
+   - Queries `invitados` by `id_visitante` (via composite → local DB).
    - Not found → logs `[E001]`, throws `BusinessException("documento no presente")`.
    - Found, `estado` non-blank → logs `[E002]`, throws `BusinessException("documento ya ingresó")`.
    - Found, `estado` null/blank → logs `[S000]`, calls `HttpAccessNotifier` with `{"doc":"<value>"}`.
-     - HTTP 200 → logs `[S001]`.
-     - HTTP non-200 → logs `[E003]`.
+     - HTTP non-200 → logs `[E003]`. No DB update.
+     - HTTP 200 → logs `[S001]`, then calls `updateEstado("1")` via composite:
+       - Local update fails → logs `[E005]`, `[S002]` is not emitted.
+       - Local update succeeds, remote fails → composite logs `[E006]`, use case logs `[S002]`.
+       - Both succeed → use case logs `[S002]`.
 8. `BusinessException` is caught at the entrypoint — the reader loop is never interrupted.
 9. Any unexpected `RuntimeException` inside the use case is caught and logged as `[E004]`.
 10. On EOF or `IOException` → `SpringApplication.exit()` so the process supervisor can restart it.
@@ -105,7 +179,7 @@ src/main/java/com/gates/msgates/
 
 - **JDK 20 or later** (Corretto 21 verified).
 - **Maven 3.9+** (or use IntelliJ's bundled Maven).
-- **PostgreSQL** accessible from the machine running the service.
+- **PostgreSQL** — both local and remote instances accessible from the machine running the service.
 
 Install Maven on macOS:
 
@@ -134,13 +208,32 @@ All values are read from environment variables. Defaults are shown and apply whe
 
 ### Environment variables
 
+**Local DB** (same machine as the service):
+
 | Variable | Default | Description |
 | --- | --- | --- |
-| `DB_HOST` | `localhost` | PostgreSQL host |
-| `DB_PORT` | `5432` | PostgreSQL port |
-| `DB_NAME` | `edc` | Database name |
-| `DB_USERNAME` | `postgres` | Database user |
-| `DB_PASSWORD` | `postgres` | Database password |
+| `LOCAL_DB_HOST` | `localhost` | Host |
+| `LOCAL_DB_PORT` | `5432` | Port |
+| `LOCAL_DB_NAME` | `edc` | Database name |
+| `LOCAL_DB_USERNAME` | `postgres` | User |
+| `LOCAL_DB_PASSWORD` | `postgres` | Password |
+| `LOCAL_DB_TABLE` | `invitados` | Table name |
+
+**Remote DB** (external, same private network):
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `REMOTE_DB_HOST` | `localhost` | Host |
+| `REMOTE_DB_PORT` | `5432` | Port |
+| `REMOTE_DB_NAME` | `edc` | Database name |
+| `REMOTE_DB_USERNAME` | `postgres` | User |
+| `REMOTE_DB_PASSWORD` | `postgres` | Password |
+| `REMOTE_DB_TABLE` | `invitados` | Table name |
+
+**HTTP notifier:**
+
+| Variable | Default | Description |
+| --- | --- | --- |
 | `ACCESS_BASE_URL` | `http://localhost:8080` | Base URL of the HTTP access notification endpoint |
 | `ACCESS_PATH` | `/api/access` | Path for the HTTP POST request |
 | `ACCESS_TIMEOUT_SECONDS` | `5` | HTTP client timeout in seconds |
@@ -157,12 +250,21 @@ EnvironmentFile=/etc/gates/ms-gates.env
 Create `/etc/gates/ms-gates.env`:
 
 ```ini
-# PostgreSQL
-DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=edc
-DB_USERNAME=myuser
-DB_PASSWORD=secret
+# Local PostgreSQL (same machine)
+LOCAL_DB_HOST=localhost
+LOCAL_DB_PORT=5432
+LOCAL_DB_NAME=edc
+LOCAL_DB_USERNAME=myuser
+LOCAL_DB_PASSWORD=secret
+LOCAL_DB_TABLE=invitados
+
+# Remote PostgreSQL (same private network)
+REMOTE_DB_HOST=192.168.x.x
+REMOTE_DB_PORT=5432
+REMOTE_DB_NAME=edc
+REMOTE_DB_USERNAME=myuser
+REMOTE_DB_PASSWORD=secret
+REMOTE_DB_TABLE=invitados
 
 # HTTP notifier
 ACCESS_BASE_URL=http://192.168.x.x:8080
@@ -180,7 +282,7 @@ sudo chmod 640 /etc/gates/ms-gates.env
 ### Overriding at runtime (dev/testing)
 
 ```bash
-DB_PASSWORD=secret ACCESS_BASE_URL=http://localhost:9000 \
+LOCAL_DB_PASSWORD=secret REMOTE_DB_HOST=192.168.x.x \
   java -jar target/ms-gates-0.0.1-SNAPSHOT.jar
 ```
 
@@ -440,12 +542,13 @@ logging:
 | --- | --- | --- | --- |
 | `S000` | `INFO` | `documento apto para ingresar` | credential found in DB, estado blank — HTTP notification about to be sent |
 | `S001` | `INFO` | `notificación HTTP exitosa` | external system responded 200 |
-| `S002` | `INFO` | `estado actualizado a '1' en DB` | DB record updated successfully after admission |
+| `S002` | `INFO` | `estado actualizado a '1' en DB` | local DB updated; remote DB also updated unless `[E006]` appears |
 | `E001` | `WARN` | `documento no presente` | credential not found in `invitados` table |
 | `E002` | `WARN` | `documento ya ingresó` | credential found but `estado` is non-blank (already admitted) |
-| `E003` | `ERROR` | `notificación HTTP fallida` | external system responded non-200 |
+| `E003` | `ERROR` | `notificación HTTP fallida` | external system responded non-200; no DB update performed |
 | `E004` | `ERROR` | `error inesperado en verificación de acceso` | unexpected runtime exception in access check |
-| `E005` | `ERROR` | `error al actualizar estado en DB` | HTTP was 200 but the DB update failed |
+| `E005` | `ERROR` | `error al actualizar estado en DB` | HTTP was 200 but the local DB update failed; `[S002]` will not appear |
+| `E006` | `ERROR` | `error al actualizar estado en DB remota` | local DB updated but remote DB sync failed (best-effort — does not block admission) |
 
 ---
 
@@ -467,7 +570,7 @@ Extraction rule: the parser returns the first `\d{5,}` **subsequence** found ins
 
 ## Database contract
 
-Table: `invitados`
+Both the local and remote databases share the same schema. The table name is independently configurable for each via `LOCAL_DB_TABLE` and `REMOTE_DB_TABLE`.
 
 ```sql
 CREATE TABLE IF NOT EXISTS invitados (
@@ -480,14 +583,16 @@ CREATE TABLE IF NOT EXISTS invitados (
 );
 ```
 
-The service queries by `id_visitante`, ordering by `id_evento DESC` and taking the most recent record (`LIMIT 1`).
+**Query strategy:** the service queries by `id_visitante`, ordering by `id_evento DESC` and taking the most recent record (`LIMIT 1`). Updates target the exact `(id_visitante, id_evento)` pair returned by that query, so only the relevant event row is modified.
 
-`estado` semantics:
+**`estado` semantics:**
 
 | Value | Meaning |
 | --- | --- |
 | `NULL` or blank (space-padded) | Visitor not yet admitted — access allowed |
 | Any non-blank character | Visitor already admitted — access denied (`[E002]`) |
+
+On successful admission the service writes `'1'` to `estado` in both databases via the Composite Adapter (see [Dual-database strategy](#dual-database-strategy--composite-adapter-pattern)).
 
 ---
 
