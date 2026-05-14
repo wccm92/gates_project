@@ -1,6 +1,7 @@
 import logging
 import signal
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -37,8 +38,17 @@ def main() -> None:
     signal.signal(signal.SIGTERM, on_shutdown)
     signal.signal(signal.SIGINT, on_shutdown)
 
+    block_seconds = config.block_seconds
+    last_scan_at = 0.0
+
     try:
         for line in reader.read_lines():
+            now = time.monotonic()
+            remaining = block_seconds - (now - last_scan_at)
+            if remaining > 0:
+                logger.debug("Scan discarded — input blocked (%.1fs remaining)", remaining)
+                continue
+            last_scan_at = now
             logger.debug("Forwarding line [length=%d]", len(line))
             print(line, flush=True)   # flush=True is critical: prevents buffering in pipes
     except KeyboardInterrupt:

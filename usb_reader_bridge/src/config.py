@@ -11,6 +11,7 @@ class Config:
     hid_device_path: str = ''       # e.g. /dev/input/event3 (optional, skips auto-detect)
     hid_vendor_id: Optional[int] = None   # hex or decimal, e.g. 0x05e0
     hid_product_id: Optional[int] = None  # hex or decimal, e.g. 0x1200
+    block_seconds: float = 6.0      # cooldown after each accepted scan
     log_level: str = 'INFO'
 
     @classmethod
@@ -22,6 +23,7 @@ class Config:
             hid_device_path=os.getenv('READER_HID_DEVICE', ''),
             hid_vendor_id=_parse_int(os.getenv('READER_HID_VID')),
             hid_product_id=_parse_int(os.getenv('READER_HID_PID')),
+            block_seconds=float(os.getenv('READER_BLOCK_SECONDS', '6')),
             log_level=os.getenv('LOG_LEVEL', 'INFO'),
         )
 
