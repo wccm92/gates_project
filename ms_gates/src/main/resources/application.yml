@@ -8,6 +8,17 @@ spring:
     driver-class-name: org.postgresql.Driver
 
 app:
+  db:
+    local:
+      url: jdbc:postgresql://${LOCAL_DB_HOST:localhost}:${LOCAL_DB_PORT:5432}/${LOCAL_DB_NAME:edc}
+      username: ${LOCAL_DB_USERNAME:postgres}
+      password: ${LOCAL_DB_PASSWORD:postgres}
+      table: ${LOCAL_DB_TABLE:invitados}
+    remote:
+      url: jdbc:postgresql://${REMOTE_DB_HOST:localhost}:${REMOTE_DB_PORT:5432}/${REMOTE_DB_NAME:edc}
+      username: ${REMOTE_DB_USERNAME:postgres}
+      password: ${REMOTE_DB_PASSWORD:postgres}
+      table: ${REMOTE_DB_TABLE:invitados}
   access:
     http:
       base-url: ${ACCESS_BASE_URL:http://localhost:8080}
