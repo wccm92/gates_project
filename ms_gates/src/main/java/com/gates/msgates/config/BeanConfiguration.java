@@ -12,10 +12,12 @@ import com.gates.msgates.domain.usecase.port.VisitorRepositoryPort;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.jdbc.DataSourceBuilder;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.web.client.RestClient;
 
 import javax.sql.DataSource;
@@ -25,6 +27,7 @@ import javax.sql.DataSource;
  * Keeps domain classes free of Spring annotations.
  */
 @Configuration
+@EnableAsync
 @EnableConfigurationProperties({
         LocalDbProperties.class,
         RemoteDbProperties.class,
@@ -102,8 +105,9 @@ public class BeanConfiguration {
 
     @Bean
     public CheckAccessUseCase checkAccessUseCase(VisitorRepositoryPort repository,
-                                                 AccessNotifierPort notifier) {
-        return new CheckAccessUseCase(repository, notifier);
+                                                 AccessNotifierPort notifier,
+                                                 ApplicationEventPublisher eventPublisher) {
+        return new CheckAccessUseCase(repository, notifier, eventPublisher);
     }
 
     // --- HTTP client ---

@@ -2,11 +2,13 @@ package com.gates.msgates.domain.usecase;
 
 import com.gates.msgates.domain.exception.BusinessException;
 import com.gates.msgates.domain.model.Credential;
+import com.gates.msgates.domain.model.VisitorAdmittedEvent;
 import com.gates.msgates.domain.model.Visitante;
 import com.gates.msgates.domain.usecase.port.AccessNotifierPort;
 import com.gates.msgates.domain.usecase.port.VisitorRepositoryPort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.ApplicationEventPublisher;
 
 import java.util.Optional;
 
@@ -16,10 +18,14 @@ public class CheckAccessUseCase {
 
     private final VisitorRepositoryPort repository;
     private final AccessNotifierPort notifier;
+    private final ApplicationEventPublisher eventPublisher;
 
-    public CheckAccessUseCase(VisitorRepositoryPort repository, AccessNotifierPort notifier) {
+    public CheckAccessUseCase(VisitorRepositoryPort repository,
+                               AccessNotifierPort notifier,
+                               ApplicationEventPublisher eventPublisher) {
         this.repository = repository;
         this.notifier = notifier;
+        this.eventPublisher = eventPublisher;
     }
 
     public void handle(Credential credential) {
@@ -50,6 +56,7 @@ public class CheckAccessUseCase {
                     repository.updateEstado(visitante, "1");
                     log.info("[S002] estado actualizado a '1' en DB — credential={}",
                             credential.value());
+                    eventPublisher.publishEvent(new VisitorAdmittedEvent(credential, visitante, "1"));
                 } catch (RuntimeException e) {
                     log.error("[E005] error al actualizar estado en DB — credential={}",
                             credential.value(), e);
