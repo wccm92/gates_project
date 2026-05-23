@@ -33,6 +33,7 @@ import javax.sql.DataSource;
 @EnableConfigurationProperties({
         LocalDbProperties.class,
         RemoteDbProperties.class,
+        CatalogDbProperties.class,
         AccessHttpProperties.class,
         ReaderProperties.class
 })
@@ -66,7 +67,22 @@ public class BeanConfiguration {
     }
 
     @Bean
+    public DataSource catalogDataSource(CatalogDbProperties props) {
+        return DataSourceBuilder.create()
+                .url(props.url())
+                .username(props.username())
+                .password(props.password())
+                .driverClassName("org.postgresql.Driver")
+                .build();
+    }
+
+    @Bean
     public JdbcTemplate remoteJdbcTemplate(@Qualifier("remoteDataSource") DataSource ds) {
+        return new JdbcTemplate(ds);
+    }
+
+    @Bean
+    public JdbcTemplate catalogJdbcTemplate(@Qualifier("catalogDataSource") DataSource ds) {
         return new JdbcTemplate(ds);
     }
 
@@ -96,7 +112,7 @@ public class BeanConfiguration {
     // --- Reader cache ---
 
     @Bean
-    public ReaderCachePort readerCachePort(@Qualifier("remoteJdbcTemplate") JdbcTemplate jdbc,
+    public ReaderCachePort readerCachePort(@Qualifier("catalogJdbcTemplate") JdbcTemplate jdbc,
                                            ReaderProperties props) {
         return new LectorxTribunaCache(jdbc, props.idTribuna());
     }
