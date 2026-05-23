@@ -1,7 +1,6 @@
 package com.gates.msgates.adapters;
 
 import com.gates.msgates.config.AccessHttpProperties;
-import com.gates.msgates.domain.model.Credential;
 import com.gates.msgates.domain.usecase.port.AccessNotifierPort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,8 +24,8 @@ public class HttpAccessNotifier implements AccessNotifierPort {
     }
 
     @Override
-    public int notify(Credential credential) {
-        String body = "{\"doc\":\"" + credential.value() + "\"}";
+    public int notify(String idPort) {
+        String body = "{\"id_port\":\"" + idPort + "\"}";
         log.debug("Sending HTTP access notification — path={}, body={}", path, body);
         try {
             ResponseEntity<Void> response = restClient.post()

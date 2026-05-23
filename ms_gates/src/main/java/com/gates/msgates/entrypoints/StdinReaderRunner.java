@@ -2,6 +2,7 @@ package com.gates.msgates.entrypoints;
 
 import com.gates.msgates.domain.exception.BusinessException;
 import com.gates.msgates.domain.model.RawReading;
+import com.gates.msgates.domain.model.ScanReading;
 import com.gates.msgates.domain.usecase.CheckAccessUseCase;
 import com.gates.msgates.domain.usecase.ProcessReadingUseCase;
 import jakarta.annotation.PreDestroy;
@@ -77,12 +78,12 @@ public class StdinReaderRunner implements ApplicationRunner {
         }
         log.debug("Received line [length={}]", line.length());
         processReadingUseCase.handle(new RawReading(line, Instant.now()))
-                .ifPresent(credential -> {
+                .ifPresent(reading -> {
                     try {
-                        checkAccessUseCase.handle(credential);
+                        checkAccessUseCase.handle(reading);
                     } catch (BusinessException e) {
                         log.debug("Business rule rejected credential={} code={} message={}",
-                                credential.value(), e.getCode(), e.getMessage());
+                                reading.credential().value(), e.getCode(), e.getMessage());
                     }
                 });
     }

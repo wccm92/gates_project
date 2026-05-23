@@ -2,12 +2,14 @@ package com.gates.msgates.config;
 
 import com.gates.msgates.adapters.CompositeVisitorRepository;
 import com.gates.msgates.adapters.JdbcVisitorRepository;
+import com.gates.msgates.adapters.LectorxTribunaCache;
 import com.gates.msgates.adapters.RemoteJdbcVisitorRepository;
 import com.gates.msgates.domain.usecase.CheckAccessUseCase;
 import com.gates.msgates.domain.usecase.ProcessReadingUseCase;
 import com.gates.msgates.domain.usecase.ReadingParser;
 import com.gates.msgates.domain.usecase.port.AccessNotifierPort;
 import com.gates.msgates.domain.usecase.port.CredentialPublisherPort;
+import com.gates.msgates.domain.usecase.port.ReaderCachePort;
 import com.gates.msgates.domain.usecase.port.VisitorRepositoryPort;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -31,7 +33,8 @@ import javax.sql.DataSource;
 @EnableConfigurationProperties({
         LocalDbProperties.class,
         RemoteDbProperties.class,
-        AccessHttpProperties.class
+        AccessHttpProperties.class,
+        ReaderProperties.class
 })
 public class BeanConfiguration {
 
@@ -90,6 +93,14 @@ public class BeanConfiguration {
         return new CompositeVisitorRepository(localVisitorRepository, remoteVisitorRepository);
     }
 
+    // --- Reader cache ---
+
+    @Bean
+    public ReaderCachePort readerCachePort(@Qualifier("remoteJdbcTemplate") JdbcTemplate jdbc,
+                                           ReaderProperties props) {
+        return new LectorxTribunaCache(jdbc, props.idTribuna());
+    }
+
     // --- Use cases ---
 
     @Bean
@@ -106,8 +117,9 @@ public class BeanConfiguration {
     @Bean
     public CheckAccessUseCase checkAccessUseCase(VisitorRepositoryPort repository,
                                                  AccessNotifierPort notifier,
+                                                 ReaderCachePort readerCachePort,
                                                  ApplicationEventPublisher eventPublisher) {
-        return new CheckAccessUseCase(repository, notifier, eventPublisher);
+        return new CheckAccessUseCase(repository, notifier, readerCachePort, eventPublisher);
     }
 
     // --- HTTP client ---

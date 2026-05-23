@@ -2,9 +2,11 @@ package com.gates.msgates.domain.usecase;
 
 import com.gates.msgates.domain.exception.BusinessException;
 import com.gates.msgates.domain.model.Credential;
+import com.gates.msgates.domain.model.ScanReading;
 import com.gates.msgates.domain.model.VisitorAdmittedEvent;
 import com.gates.msgates.domain.model.Visitante;
 import com.gates.msgates.domain.usecase.port.AccessNotifierPort;
+import com.gates.msgates.domain.usecase.port.ReaderCachePort;
 import com.gates.msgates.domain.usecase.port.VisitorRepositoryPort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,17 +20,22 @@ public class CheckAccessUseCase {
 
     private final VisitorRepositoryPort repository;
     private final AccessNotifierPort notifier;
+    private final ReaderCachePort readerCache;
     private final ApplicationEventPublisher eventPublisher;
 
     public CheckAccessUseCase(VisitorRepositoryPort repository,
                                AccessNotifierPort notifier,
+                               ReaderCachePort readerCache,
                                ApplicationEventPublisher eventPublisher) {
         this.repository = repository;
         this.notifier = notifier;
+        this.readerCache = readerCache;
         this.eventPublisher = eventPublisher;
     }
 
-    public void handle(Credential credential) {
+    public void handle(ScanReading reading) {
+        Credential credential = reading.credential();
+        int idLector = reading.idLector();
         try {
             Optional<Visitante> found = repository.findByCredential(credential);
 
@@ -47,11 +54,18 @@ public class CheckAccessUseCase {
 
             log.info("[S000] documento apto para ingresar — credential={}", credential.value());
 
-            int statusCode = notifier.notify(credential);
+            Optional<String> portId = readerCache.findPortId(idLector);
+            if (portId.isEmpty()) {
+                log.warn("[E008] id_puerto no encontrado para lector — credential={}, id_lector={}",
+                        credential.value(), idLector);
+                throw new BusinessException("E008", "id_puerto no encontrado para lector");
+            }
+
+            int statusCode = notifier.notify(portId.get());
 
             if (statusCode == 200) {
-                log.info("[S001] notificación HTTP exitosa — credential={}, status={}",
-                        credential.value(), statusCode);
+                log.info("[S001] notificación HTTP exitosa — credential={}, id_lector={}, status={}",
+                        credential.value(), idLector, statusCode);
                 try {
                     repository.updateEstado(visitante, "1");
                     log.info("[S002] estado actualizado a '1' en DB — credential={}",

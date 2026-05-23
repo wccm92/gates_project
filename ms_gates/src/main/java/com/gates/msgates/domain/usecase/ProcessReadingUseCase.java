@@ -1,7 +1,7 @@
 package com.gates.msgates.domain.usecase;
 
-import com.gates.msgates.domain.model.Credential;
 import com.gates.msgates.domain.model.RawReading;
+import com.gates.msgates.domain.model.ScanReading;
 import com.gates.msgates.domain.usecase.port.CredentialPublisherPort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,16 +20,16 @@ public class ProcessReadingUseCase {
         this.publisher = publisher;
     }
 
-    public Optional<Credential> handle(RawReading raw) {
+    public Optional<ScanReading> handle(RawReading raw) {
         try {
-            Optional<Credential> credential = parser.parse(raw);
-            if (credential.isEmpty()) {
-                log.warn("Discarded reading: no numeric attribute of 5+ digits found [length={}]",
+            Optional<ScanReading> reading = parser.parse(raw);
+            if (reading.isEmpty()) {
+                log.warn("Discarded reading: could not parse id_lector or credential [length={}]",
                         raw.payload().length());
                 return Optional.empty();
             }
-            publisher.publish(credential.get());
-            return credential;
+            publisher.publish(reading.get().credential());
+            return reading;
         } catch (RuntimeException e) {
             log.error("Unexpected failure while processing reading", e);
             return Optional.empty();
