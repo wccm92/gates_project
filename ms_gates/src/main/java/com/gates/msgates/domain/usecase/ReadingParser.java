@@ -15,7 +15,7 @@ import java.util.regex.Pattern;
  */
 public class ReadingParser {
 
-    private static final String FIELD_DELIMITER = "\\|";
+    private static final String FIELD_DELIMITER = "[|`]";
     private static final Pattern NUMERIC_SEQUENCE = Pattern.compile("\\d{5,}");
 
     public Optional<ScanReading> parse(RawReading raw) {
