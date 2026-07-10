@@ -1,6 +1,6 @@
 # ms-gates
 
-Java microservice that powers turnstile access control. Reads pipe-delimited scans from a physical USB reader over `stdin`, extracts the numeric credential (≥5 digits), validates it against a PostgreSQL database, and notifies an external system via HTTP when access is granted.
+Java microservice that powers turnstile access control. Reads pipe/backtick-delimited scans from a physical USB reader over `stdin`, extracts the **reader id (`id_lector`)** and the **numeric credential (≥5 digits)**, validates the credential against a PostgreSQL database, resolves the physical **door id (`id_puerto`)** from an in-memory reader cache, notifies an external system via HTTP when access is granted, and updates the visitor state across two databases.
 
 ---
 
@@ -9,6 +9,8 @@ Java microservice that powers turnstile access control. Reads pipe-delimited sca
 - [Architecture](#architecture)
   - [Hexagonal overview](#hexagonal-overview)
   - [Dual-database strategy — Composite Adapter pattern](#dual-database-strategy--composite-adapter-pattern)
+  - [Reader cache (catalog DB)](#reader-cache-catalog-db)
+  - [Alias admission (prefix `0`) — async event](#alias-admission-prefix-0--async-event)
   - [Package layout](#package-layout)
   - [Runtime flow](#runtime-flow)
 - [Prerequisites](#prerequisites)
@@ -33,7 +35,7 @@ Java microservice that powers turnstile access control. Reads pipe-delimited sca
 
 ### Hexagonal overview
 
-Clean / hexagonal layering. The microservice does **not** know it is talking to a USB reader — its only contract is "newline-terminated, pipe-delimited text on `stdin`". Hardware bridging lives in an OS-level wrapper.
+Clean / hexagonal layering. The microservice does **not** know it is talking to a USB reader — its only contract is "newline-terminated, pipe/backtick-delimited text on `stdin`". Hardware bridging lives in an OS-level wrapper.
 
 ```
 ┌─────────────────────┐     ┌──────────────────────┐     ┌────────────────────┐
@@ -48,19 +50,25 @@ Clean / hexagonal layering. The microservice does **not** know it is talking to 
                                          │  └─ remote PostgreSQL  (best-effort) │
                                          └──────────────────────────────────────┘
 
+                                         ┌──────────────────────────────────────┐
+              reader → door mapping ──▶  │  LectorxTribunaCache  (catalog DB)    │
+                     (loaded at startup) │  id_lector ──▶ id_puerto              │
+                                         └──────────────────────────────────────┘
+
                                          ┌──────────────────┐
                        HTTP notify  ──▶  │  External system  │
                                          │  POST /api/access │
+                                         │  {"id_port":"…"}  │
                                          └──────────────────┘
 ```
 
-The domain use case (`CheckAccessUseCase`) is aware of **one** repository port. The fact that two physical databases exist is invisible to it — that is the job of the Composite Adapter described below.
+The domain use case (`CheckAccessUseCase`) is aware of three output ports: `VisitorRepositoryPort` (DB), `ReaderCachePort` (reader→door mapping) and `AccessNotifierPort` (HTTP). It never learns that two visitor databases exist or that the reader cache is backed by a third database — that is the job of the adapters described below.
 
 ---
 
 ### Dual-database strategy — Composite Adapter pattern
 
-The service must keep two independent PostgreSQL databases in sync: a **local** one (on the same machine) and a **remote** one (on the same private network). Naively, you might add a second port to the domain or make the use case call each database explicitly. Both approaches leak infrastructure topology into business logic.
+The service must keep two independent PostgreSQL databases in sync for the visitor state: a **local** one (on the same machine) and a **remote** one (on the same private network). Naively, you might add a second port to the domain or make the use case call each database explicitly. Both approaches leak infrastructure topology into business logic.
 
 The chosen solution is the **Composite Adapter pattern**:
 
@@ -90,25 +98,61 @@ CompositeVisitorRepository     ← adapter layer, invisible to the domain
   - **Local DB** — treated as **critical**. If the update fails, the exception propagates to the use case, which logs `[E005]` and `[S002]` is not emitted.
   - **Remote DB** — treated as **best-effort**. If the update fails, `CompositeVisitorRepository` catches the exception, logs `[E006]`, and does **not** re-throw. The use case proceeds normally and logs `[S002]`.
 
+> The `[S002]` success line is emitted **once**, by the use case (`CheckAccessUseCase`) after `updateEstado` returns — the business layer owns business status codes. The composite only logs the remote failure `[E006]`.
+
 **Why this design?**
 
 | Concern | Decision |
 | --- | --- |
 | Domain isolation | Use case never imports JDBC, knows nothing about local vs. remote |
 | Failure tolerance | A remote DB outage does not block admissions |
-| Extensibility | Adding a third database requires only a new adapter + one line in the composite; no domain change |
+| Extensibility | Adding a third visitor database requires only a new adapter + one line in the composite; no domain change |
 | Testability | Each adapter can be unit-tested independently; the composite can be tested with mocks |
 
 **Key classes:**
 
 | Class | Package | Role |
 | --- | --- | --- |
-| `VisitorRepositoryPort` | `domain.usecase.port` | Output port — the only DB abstraction the domain sees |
-| `JdbcVisitorRepository` | `adapters` | Local PostgreSQL — `find` + `update` |
-| `RemoteJdbcVisitorRepository` | `adapters` | Remote PostgreSQL — `update` only |
-| `CompositeVisitorRepository` | `adapters` | Implements the port; routes calls to both adapters |
+| `VisitorRepositoryPort` | `domain.usecase.port` | Output port — the only visitor-DB abstraction the domain sees |
+| `JdbcVisitorRepository` | `adapters` | Local PostgreSQL — `find` + `update` (implements the port) |
+| `RemoteJdbcVisitorRepository` | `adapters` | Remote PostgreSQL — `update` only (plain class, not the port) |
+| `CompositeVisitorRepository` | `adapters` | Implements the port; routes reads to local, writes to both |
 
 The composition is wired entirely in `BeanConfiguration` — no Spring annotations in domain or adapter classes.
+
+---
+
+### Reader cache (catalog DB)
+
+Each physical reader (`id_lector`) maps to a physical door/port (`id_puerto`). That mapping lives in a **third** database — the **catalog** DB — in the `lectorxtribuna` table, scoped by a tribune id (`id_tribuna`).
+
+- `LectorxTribunaCache` (implements `ReaderCachePort`) loads the full `id_lector → id_puerto` map **once, at startup**, for the configured `READER_ID_TRIBUNA`, and keeps it in an immutable in-memory `Map`. There is no per-scan query to the catalog DB.
+- **Fail-fast:** if the cache cannot be loaded at startup (catalog DB unreachable, bad query, etc.) it logs `[E000]` and throws — **the service does not start**. This is deliberate: a gate that cannot resolve its doors must not run.
+- At access time, `CheckAccessUseCase` calls `readerCache.findPortId(idLector)`. A miss logs `[E008]` and throws a `BusinessException` — no HTTP notification is sent.
+
+```
+Domain use case
+      │  findPortId(idLector)
+      ▼
+ReaderCachePort  ──implemented by──▶  LectorxTribunaCache   (catalog DB, loaded at startup)
+```
+
+---
+
+### Alias admission (prefix `0`) — async event
+
+Some visitors exist in the database under a second "alias" credential formed by prefixing the scanned credential with `"0"` (e.g. scan `12345678` → alias `012345678`). When a visitor is admitted, that alias — if present and not yet admitted — must also be marked as admitted.
+
+This is handled **asynchronously and out of the critical path**:
+
+1. On a successful admission, `CheckAccessUseCase` publishes a Spring `VisitorAdmittedEvent`.
+2. `VisitorAliasUpdaterListener` (`@Async @EventListener`) reacts on a separate thread:
+   - Looks up `"0" + credential`.
+   - Not found → no-op (silent).
+   - Found but already admitted → `[S003]`.
+   - Found and pending → `updateEstado` and log `[S004]`; on failure log `[E007]`.
+
+Because it is `@Async`, alias updating never delays the reader loop or the primary admission response. `@EnableAsync` is on `BeanConfiguration`.
 
 ---
 
@@ -118,60 +162,73 @@ The composition is wired entirely in `BeanConfiguration` — no Spring annotatio
 src/main/java/com/gates/msgates/
 ├── MsGatesApplication.java                       Spring Boot entry point
 ├── config/
-│   ├── BeanConfiguration.java                    wires domain beans and infrastructure
+│   ├── BeanConfiguration.java                    wires domain beans + infrastructure (@EnableAsync)
 │   ├── AccessHttpProperties.java                 typed config for HTTP notifier
 │   ├── LocalDbProperties.java                    typed config for local PostgreSQL
-│   └── RemoteDbProperties.java                   typed config for remote PostgreSQL
+│   ├── RemoteDbProperties.java                   typed config for remote PostgreSQL
+│   ├── CatalogDbProperties.java                  typed config for catalog PostgreSQL (reader cache)
+│   └── ReaderProperties.java                     typed config for id_tribuna
 ├── domain/                                       framework-free
 │   ├── model/
 │   │   ├── RawReading.java                       record: payload + receivedAt
+│   │   ├── ScanReading.java                      record: credential + idLector
 │   │   ├── Credential.java                       record: validated numeric (≥5 digits)
-│   │   └── Visitante.java                        record: maps invitados table row
+│   │   ├── Visitante.java                        record: maps invitados table row
+│   │   └── VisitorAdmittedEvent.java             record: published on successful admission
 │   ├── exception/
 │   │   └── BusinessException.java                domain business error with code
 │   └── usecase/
-│       ├── ReadingParser.java                    pure parser
-│       ├── ProcessReadingUseCase.java            extracts credential, publishes to stdout
-│       ├── CheckAccessUseCase.java               validates credential and notifies
+│       ├── ReadingParser.java                    pure parser (id_lector + credential)
+│       ├── ProcessReadingUseCase.java            parses reading, publishes credential to stdout
+│       ├── CheckAccessUseCase.java               validates, resolves door, notifies, updates
 │       └── port/
 │           ├── CredentialPublisherPort.java      output port: stdout
-│           ├── VisitorRepositoryPort.java        output port: DB lookup + update
+│           ├── VisitorRepositoryPort.java        output port: visitor DB lookup + update
+│           ├── ReaderCachePort.java              output port: id_lector → id_puerto
 │           └── AccessNotifierPort.java           output port: HTTP notification
 ├── adapters/
 │   ├── ConsoleCredentialPublisher.java           prints credential to stdout
 │   ├── JdbcVisitorRepository.java               local PostgreSQL adapter (find + update)
 │   ├── RemoteJdbcVisitorRepository.java         remote PostgreSQL adapter (update only)
 │   ├── CompositeVisitorRepository.java          routes reads to local, writes to both
+│   ├── LectorxTribunaCache.java                 reader→door cache from catalog DB (startup load)
+│   ├── VisitorAliasUpdaterListener.java         @Async listener: admits the "0"-prefixed alias
 │   └── HttpAccessNotifier.java                  HTTP POST adapter
 └── entrypoints/
     └── StdinReaderRunner.java                    daemon reader thread
 ```
 
-`domain/*` has zero Spring annotations. Only `adapters/` and `entrypoints/` touch the framework. Beans are wired in `config/BeanConfiguration.java`.
+`domain/*` has zero Spring annotations. Only `adapters/`, `entrypoints/` and `config/` touch the framework. Domain beans are wired in `config/BeanConfiguration.java`; `@Component` is used only on framework-facing adapters/entrypoints.
 
 ---
 
 ### Runtime flow
 
-1. Spring boots → `StdinReaderRunner.run()` launches a daemon thread named `stdin-reader`.
-2. The thread loops `BufferedReader.readLine()` on UTF-8 `System.in`.
-3. Each non-blank line ≤1 KiB becomes a `RawReading(payload, Instant.now())`.
-4. `ProcessReadingUseCase` calls `ReadingParser`, which splits on `|` and finds the first token containing `\d{5,}`.
-5. On hit → `ConsoleCredentialPublisher.publish()` logs `INFO` and prints the numeric to stdout. Returns `Optional<Credential>`.
-6. On miss → `WARN` log, reading dropped, loop continues.
-7. If a credential was extracted, `CheckAccessUseCase.handle()` runs:
+1. Spring boots → `LectorxTribunaCache` loads the reader→door map from the catalog DB (`[E000]` + hard fail if it can't).
+2. `StdinReaderRunner.run()` launches a daemon thread named `stdin-reader`.
+3. The thread loops `BufferedReader.readLine()` on UTF-8 `System.in`.
+4. Each non-blank line ≤1 KiB becomes a `RawReading(payload, Instant.now())`.
+5. `ProcessReadingUseCase` calls `ReadingParser`, which splits on `|` or backtick and expects:
+   - **token[0]** = `id_lector` (must parse as an integer),
+   - the first remaining token containing `\d{5,}` = the credential.
+   Result: `ScanReading(credential, idLector)`.
+6. On hit → `ConsoleCredentialPublisher.publish()` logs `INFO` and prints the numeric to stdout. Returns `Optional<ScanReading>`.
+7. On miss (blank, `<2` tokens, non-numeric token[0], or no credential) → `WARN` log, reading dropped, loop continues.
+8. If a `ScanReading` was produced, `CheckAccessUseCase.handle()` runs:
    - Queries `invitados` by `id_visitante` (via composite → local DB).
-   - Not found → logs `[E001]`, throws `BusinessException("documento no presente")`.
-   - Found, `estado` non-blank → logs `[E002]`, throws `BusinessException("documento ya ingresó")`.
-   - Found, `estado` null/blank → logs `[S000]`, calls `HttpAccessNotifier` with `{"doc":"<value>"}`.
-     - HTTP non-200 → logs `[E003]`. No DB update.
-     - HTTP 200 → logs `[S001]`, then calls `updateEstado("1")` via composite:
-       - Local update fails → logs `[E005]`, `[S002]` is not emitted.
-       - Local update succeeds, remote fails → composite logs `[E006]`, use case logs `[S002]`.
-       - Both succeed → use case logs `[S002]`.
-8. `BusinessException` is caught at the entrypoint — the reader loop is never interrupted.
-9. Any unexpected `RuntimeException` inside the use case is caught and logged as `[E004]`.
-10. On EOF or `IOException` → `SpringApplication.exit()` so the process supervisor can restart it.
+   - Not found → logs `[E001]`, throws `BusinessException("E001", …)`.
+   - Found, `estado` non-blank → logs `[E002]`, throws `BusinessException("E002", …)`.
+   - Found, `estado` null/blank → logs `[S000]`, then resolves the door:
+     - `readerCache.findPortId(idLector)` empty → logs `[E008]`, throws `BusinessException("E008", …)`. No HTTP call.
+     - Found → calls `HttpAccessNotifier.notify(idPuerto)` with body `{"id_port":"<idPuerto>"}`.
+       - HTTP non-200 → logs `[E003]`. No DB update.
+       - HTTP 200 → logs `[S001]`, then `updateEstado("1")` via composite:
+         - Local update fails → logs `[E005]`, `[S002]` is not emitted.
+         - Local update succeeds → logs `[S002]` and publishes `VisitorAdmittedEvent` (remote sync happens inside the composite; failure there is `[E006]`, non-blocking).
+9. `VisitorAdmittedEvent` triggers the async alias updater (`[S003]`/`[S004]`/`[E007]`), off the reader thread.
+10. `BusinessException` is caught at the entrypoint — the reader loop is never interrupted.
+11. Any unexpected `RuntimeException` inside the use case is caught and logged as `[E004]`.
+12. On EOF or `IOException` → `SpringApplication.exit()` so the process supervisor can restart it.
 
 ---
 
@@ -179,7 +236,7 @@ src/main/java/com/gates/msgates/
 
 - **JDK 20 or later** (Corretto 21 verified).
 - **Maven 3.9+** (or use IntelliJ's bundled Maven).
-- **PostgreSQL** — both local and remote instances accessible from the machine running the service.
+- **PostgreSQL** — local, remote and catalog instances accessible from the machine running the service. (In simple deployments the catalog can be the same instance/DB as local.)
 
 Install Maven on macOS:
 
@@ -208,7 +265,7 @@ All values are read from environment variables. Defaults are shown and apply whe
 
 ### Environment variables
 
-**Local DB** (same machine as the service):
+**Local DB** (same machine as the service — authoritative reads + critical writes):
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -217,9 +274,9 @@ All values are read from environment variables. Defaults are shown and apply whe
 | `LOCAL_DB_NAME` | `edc` | Database name |
 | `LOCAL_DB_USERNAME` | `postgres` | User |
 | `LOCAL_DB_PASSWORD` | `postgres` | Password |
-| `LOCAL_DB_TABLE` | `invitados` | Table name |
+| `LOCAL_DB_TABLE` | `invitados` | Visitor table name |
 
-**Remote DB** (external, same private network):
+**Remote DB** (external, same private network — best-effort writes):
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -228,7 +285,25 @@ All values are read from environment variables. Defaults are shown and apply whe
 | `REMOTE_DB_NAME` | `edc` | Database name |
 | `REMOTE_DB_USERNAME` | `postgres` | User |
 | `REMOTE_DB_PASSWORD` | `postgres` | Password |
-| `REMOTE_DB_TABLE` | `invitados` | Table name |
+| `REMOTE_DB_TABLE` | `invitados` | Visitor table name |
+
+**Catalog DB** (reader → door mapping, loaded once at startup):
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CATALOG_DB_HOST` | `localhost` | Host |
+| `CATALOG_DB_PORT` | `5432` | Port |
+| `CATALOG_DB_NAME` | `edc` | Database name |
+| `CATALOG_DB_USERNAME` | `postgres` | User |
+| `CATALOG_DB_PASSWORD` | `postgres` | Password |
+
+**Reader:**
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `READER_ID_TRIBUNA` | `tribune` | Tribune id used to filter `lectorxtribuna` at startup. **Must be an integer at runtime** (`app.reader.id-tribuna` binds to `int`) |
+
+> ⚠️ The default `tribune` is a placeholder for local wiring; a real deployment must set `READER_ID_TRIBUNA` to the numeric tribune id, otherwise startup fails binding the property.
 
 **HTTP notifier:**
 
@@ -266,6 +341,16 @@ REMOTE_DB_USERNAME=myuser
 REMOTE_DB_PASSWORD=secret
 REMOTE_DB_TABLE=invitados
 
+# Catalog PostgreSQL (reader → door mapping)
+CATALOG_DB_HOST=localhost
+CATALOG_DB_PORT=5432
+CATALOG_DB_NAME=edc
+CATALOG_DB_USERNAME=myuser
+CATALOG_DB_PASSWORD=secret
+
+# Reader
+READER_ID_TRIBUNA=1
+
 # HTTP notifier
 ACCESS_BASE_URL=http://192.168.x.x:8080
 ACCESS_PATH=/api/access
@@ -282,7 +367,7 @@ sudo chmod 640 /etc/gates/ms-gates.env
 ### Overriding at runtime (dev/testing)
 
 ```bash
-LOCAL_DB_PASSWORD=secret REMOTE_DB_HOST=192.168.x.x \
+LOCAL_DB_PASSWORD=secret REMOTE_DB_HOST=192.168.x.x READER_ID_TRIBUNA=1 \
   java -jar target/ms-gates-0.0.1-SNAPSHOT.jar
 ```
 
@@ -303,13 +388,15 @@ java -jar target/ms-gates-0.0.1-SNAPSHOT.jar
 java -jar target/ms-gates-0.0.1-SNAPSHOT.jar < fixtures/readings.txt
 ```
 
-The process keeps running until `stdin` closes (`Ctrl+D`, pipe closed) or a `SIGTERM` arrives (`Ctrl+C`).
+The process keeps running until `stdin` closes (`Ctrl+D`, pipe closed) or a `SIGTERM` arrives (`Ctrl+C`). It will **refuse to start** if the catalog reader cache can't be loaded (`[E000]`).
 
 ---
 
 ## Testing guide
 
 Progressive levels — start at Level 1 and stop once you've reached the confidence you need.
+
+> Every reading now needs a leading `id_lector` token. `EVENT|CARD|12345678|DOOR-01` will **not** parse (token[0] `EVENT` is not an integer). Use e.g. `7|CARD|12345678|DOOR-01`, where `7` is a reader id present in the catalog cache.
 
 ### Level 1 — Sanity check: does the context start?
 
@@ -320,14 +407,15 @@ mvn spring-boot:run
 Expected log lines:
 
 ```
+[S_INIT] caché de lectores cargada — id_tribuna=…, entradas=…
 Started MsGatesApplication in X.X seconds
 Starting stdin reader thread
 ```
 
-Type a line and press Enter:
+Type a line and press Enter (`7` = a reader id in the cache):
 
 ```
-EVENT|CARD|12345678|DOOR-01
+7|CARD|12345678|DOOR-01
 ```
 
 Expected:
@@ -348,29 +436,31 @@ Fastest feedback loop.
 
 ```bash
 java -jar target/ms-gates-0.0.1-SNAPSHOT.jar <<'EOF'
-EVENT|CARD|12345678|DOOR-01
-EVENT|CARD|999|DOOR-02
+7|CARD|12345678|DOOR-01
+7|CARD|999|DOOR-02
 |||
-BADGE-SCAN|USER|ABC123456|TURNSTILE-A
+7|USER|ABC123456|TURNSTILE-A
+EVENT|CARD|12345678|DOOR-01
 EOF
 ```
 
 | Input | Result |
 | --- | --- |
-| `EVENT\|CARD\|12345678\|DOOR-01` | prints `12345678`, then access check runs |
-| `EVENT\|CARD\|999\|DOOR-02` | no print, WARN "no numeric attribute of 5+ digits found" |
+| `7\|CARD\|12345678\|DOOR-01` | prints `12345678`, then access check runs for reader 7 |
+| `7\|CARD\|999\|DOOR-02` | no print, WARN "could not parse id_lector or credential" |
 | `\|\|\|` | no print, WARN |
-| `BADGE-SCAN\|USER\|ABC123456\|TURNSTILE-A` | prints `123456`, then access check runs |
+| `7\|USER\|ABC123456\|TURNSTILE-A` | prints `123456`, then access check runs |
+| `EVENT\|CARD\|12345678\|DOOR-01` | no print, WARN — token[0] `EVENT` is not an integer |
 
 After the last line, EOF closes stdin, runner logs `stdin closed (EOF)` and Spring exits with code 0.
 
 **One-liner:**
 
 ```bash
-echo 'HDR|CARD-ID:00012345|DOOR-5' | java -jar target/ms-gates-0.0.1-SNAPSHOT.jar
+echo '5`CARD-ID:00012345`DOOR-5' | java -jar target/ms-gates-0.0.1-SNAPSHOT.jar
 ```
 
-Expected stdout: `00012345`.
+Expected stdout: `00012345` (backtick delimiter, reader id `5`).
 
 ---
 
@@ -381,14 +471,14 @@ Representative test set covering happy and malformed cases.
 ```bash
 mkdir -p fixtures
 cat > fixtures/readings.txt <<'EOF'
-EVENT|CARD|12345678|DOOR-01
-EVENT|CARD|87654321|DOOR-02
+7|CARD|12345678|DOOR-01
+7|CARD|87654321|DOOR-02
 GARBAGE_NO_PIPES
-EVENT|CARD||DOOR-03
-EVENT|CARD|12|DOOR-04
-EVENT|CARD|CARD-ID:55554444|DOOR-05
+7|CARD||DOOR-03
+7|CARD|12|DOOR-04
+7|CARD-ID:55554444|DOOR-05
 
-EVENT|CARD|99999999|DOOR-06
+7|CARD|99999999|DOOR-06
 EOF
 
 java -jar target/ms-gates-0.0.1-SNAPSHOT.jar < fixtures/readings.txt
@@ -415,9 +505,9 @@ java -jar target/ms-gates-0.0.1-SNAPSHOT.jar < /tmp/reader.fifo
 **Terminal B** — push scans as if the reader is emitting them:
 
 ```bash
-echo 'EVENT|CARD|12345678|DOOR-01' > /tmp/reader.fifo
+echo '7|CARD|12345678|DOOR-01' > /tmp/reader.fifo
 sleep 1
-echo 'EVENT|CARD|87654321|DOOR-02' > /tmp/reader.fifo
+echo '7|CARD|87654321|DOOR-02' > /tmp/reader.fifo
 ```
 
 Terminal A prints each numeric as it arrives, runs the access check, and keeps waiting — exactly the production behavior.
@@ -427,7 +517,7 @@ Terminal A prints each numeric as it arrives, runs the access check, and keeps w
 ```bash
 # Terminal B
 exec 3>/tmp/reader.fifo
-echo 'EVENT|CARD|55554444|DOOR-03' >&3
+echo '7|CARD|55554444|DOOR-03' >&3
 exec 3>&-   # close FD 3 → Java sees EOF
 ```
 
@@ -446,7 +536,7 @@ rm /tmp/reader.fifo
 **Oversized line (>1 KiB):**
 
 ```bash
-python3 -c "print('X' * 2000 + '|12345678')" | java -jar target/ms-gates-0.0.1-SNAPSHOT.jar
+python3 -c "print('7|' + 'X' * 2000 + '|12345678')" | java -jar target/ms-gates-0.0.1-SNAPSHOT.jar
 ```
 
 Expected: WARN `Dropping oversized line`, no stdout, process exits at EOF.
@@ -457,7 +547,7 @@ Expected: WARN `Dropping oversized line`, no stdout, process exits at EOF.
 head -c 200 /dev/urandom | java -jar target/ms-gates-0.0.1-SNAPSHOT.jar
 ```
 
-Should log WARNs (or occasional INFO if random bytes happen to contain 5+ digits) and exit without a stack trace.
+Should log WARNs and exit without a stack trace.
 
 **Killing mid-stream:**
 
@@ -467,6 +557,14 @@ kill -TERM %1
 ```
 
 `@PreDestroy` flips `running = false`, the reader loop exits, Spring shuts down cleanly. Exit code 143 (128 + SIGTERM) is expected.
+
+**Catalog DB unreachable at startup:**
+
+```bash
+CATALOG_DB_PORT=1 java -jar target/ms-gates-0.0.1-SNAPSHOT.jar
+```
+
+Expected: `[E000] no se pudo cargar la caché de lectores…`, `IllegalStateException`, the context fails to start. This is the intended fail-fast behavior.
 
 ---
 
@@ -503,7 +601,7 @@ Common rates: 9600, 19200, 38400, 115200.
 
 #### Step 2b — HID keyboard-emulating reader
 
-`stdin` cannot see HID keyboard events directly (they go to the focused window). A Python HID bridge process reads the USB HID interface and writes one scan per line to stdout. Pipe that bridge into the Java process the same way as Step 2a.
+`stdin` cannot see HID keyboard events directly (they go to the focused window). A Python HID bridge process reads the USB HID interface and writes one scan per line to stdout — prefixed with the reader id and using `|` or backtick delimiters. Pipe that bridge into the Java process the same way as Step 2a.
 
 ---
 
@@ -523,14 +621,16 @@ logging:
     com.gates.msgates: DEBUG
 ```
 
-### Stdin reader & parser
+### Startup, stdin reader & parser
 
 | Level | Message | Meaning |
 | --- | --- | --- |
+| `INFO` | `[S_INIT] caché de lectores cargada` | reader→door cache loaded successfully at startup |
+| `ERROR` | `[E000] no se pudo cargar la caché de lectores` | catalog cache load failed — service will not start |
 | `INFO` | `Starting stdin reader thread` | runner wired correctly |
 | `DEBUG` | `Received line [length=…]` | reader is flowing |
 | `INFO` | `Credential extracted: …` | credential parsed and printed to stdout |
-| `WARN` | `Discarded reading: no numeric attribute…` | parser couldn't find `\d{5,}` |
+| `WARN` | `Discarded reading: could not parse id_lector or credential` | parser couldn't find an integer `id_lector` and a `\d{5,}` credential |
 | `WARN` | `Dropping oversized line` | defensive 1 KiB cap hit |
 | `ERROR` | `Unexpected failure while processing reading` | unexpected bug in parse/publish path |
 | `ERROR` | `stdin read failed…` | IO death — supervisor will restart |
@@ -540,15 +640,19 @@ logging:
 
 | Code | Level | Message | Meaning |
 | --- | --- | --- | --- |
-| `S000` | `INFO` | `documento apto para ingresar` | credential found in DB, estado blank — HTTP notification about to be sent |
+| `S000` | `INFO` | `documento apto para ingresar` | credential found in DB, estado blank — proceeding to door resolution |
 | `S001` | `INFO` | `notificación HTTP exitosa` | external system responded 200 |
-| `S002` | `INFO` | `estado actualizado a '1' en DB` | local DB updated; remote DB also updated unless `[E006]` appears |
+| `S002` | `INFO` | `estado actualizado a '1' en DB` | local DB updated (emitted once by the use case); remote DB also updated unless `[E006]` appears |
+| `S003` | `INFO` | `alias con prefijo '0' ya ingresado` | the `"0"`-prefixed alias visitor was already admitted (async) |
+| `S004` | `INFO` | `alias con prefijo '0' actualizado` | the `"0"`-prefixed alias visitor was admitted too (async) |
 | `E001` | `WARN` | `documento no presente` | credential not found in `invitados` table |
 | `E002` | `WARN` | `documento ya ingresó` | credential found but `estado` is non-blank (already admitted) |
 | `E003` | `ERROR` | `notificación HTTP fallida` | external system responded non-200; no DB update performed |
 | `E004` | `ERROR` | `error inesperado en verificación de acceso` | unexpected runtime exception in access check |
 | `E005` | `ERROR` | `error al actualizar estado en DB` | HTTP was 200 but the local DB update failed; `[S002]` will not appear |
 | `E006` | `ERROR` | `error al actualizar estado en DB remota` | local DB updated but remote DB sync failed (best-effort — does not block admission) |
+| `E007` | `ERROR` | `error al actualizar alias con prefijo '0'` | async alias update failed |
+| `E008` | `WARN` | `id_puerto no encontrado para lector` | `id_lector` not present in the reader cache; no HTTP notification sent |
 
 ---
 
@@ -558,17 +662,22 @@ logging:
 | --- | --- |
 | Encoding | UTF-8 |
 | Record separator | `\n` (or `\r\n`, handled by `readLine()`) |
-| Field separator | `\|` |
+| Field separator | `\|` **or** backtick (`` ` ``) |
+| First field (`token[0]`) | `id_lector` — must parse as an integer |
+| Credential | first remaining token containing `\d{5,}` |
 | One reading per | line |
 | Trailing fields | allowed |
+| Min tokens | 2 (id_lector + at least one more) |
 | Max line length | 1 KiB (oversize dropped with WARN) |
 | Malformed lines | tolerated, logged, dropped |
 
-Extraction rule: the parser returns the first `\d{5,}` **subsequence** found inside any pipe-delimited token (via `Matcher.find()`). So `CARD-ID:12345678` yields `12345678`.
+Extraction rule: after splitting, `token[0]` is parsed as the integer reader id; then the parser returns the first `\d{5,}` **subsequence** found inside any remaining token (via `Matcher.find()`). So `7|CARD-ID:12345678` yields reader `7` and credential `12345678`.
 
 ---
 
 ## Database contract
+
+### Visitor tables (local + remote)
 
 Both the local and remote databases share the same schema. The table name is independently configurable for each via `LOCAL_DB_TABLE` and `REMOTE_DB_TABLE`.
 
@@ -592,13 +701,27 @@ CREATE TABLE IF NOT EXISTS invitados (
 | `NULL` or blank (space-padded) | Visitor not yet admitted — access allowed |
 | Any non-blank character | Visitor already admitted — access denied (`[E002]`) |
 
-On successful admission the service writes `'1'` to `estado` in both databases via the Composite Adapter (see [Dual-database strategy](#dual-database-strategy--composite-adapter-pattern)).
+On successful admission the service writes `'1'` to `estado` in both databases via the Composite Adapter (see [Dual-database strategy](#dual-database-strategy--composite-adapter-pattern)). The `"0"`-prefixed alias, if present, is updated asynchronously (see [Alias admission](#alias-admission-prefix-0--async-event)).
+
+### Catalog table (reader → door)
+
+The catalog DB holds the reader-to-door mapping, loaded once at startup filtered by `READER_ID_TRIBUNA`:
+
+```sql
+SELECT id_lector, id_puerto FROM lectorxtribuna WHERE id_tribuna = ?;
+```
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `id_lector` | INTEGER | physical reader id — matches `token[0]` of a scan |
+| `id_puerto` | TEXT | physical door/port id — sent to the external system as `{"id_port":"…"}` |
+| `id_tribuna` | INTEGER | tribune grouping — filter for this deployment |
 
 ---
 
 ## Production deployment notes
 
-The process is intentionally short-lived on error — EOF or `IOException` triggers `SpringApplication.exit()`. The systemd unit supervises the full pipeline (Python HID bridge → Java service) with `Restart=always`.
+The process is intentionally short-lived on error — EOF or `IOException` triggers `SpringApplication.exit()`; a failure to load the reader cache at startup prevents boot entirely. The systemd unit supervises the full pipeline (Python HID bridge → Java service) with `Restart=always`.
 
 ### systemd unit example
 
@@ -632,7 +755,7 @@ sudo journalctl -u gates-pipeline -f
 ### Environment files
 
 - `/etc/gates/bridge.env` — Python HID bridge variables (USB VID/PID, log level, reader mode).
-- `/etc/gates/ms-gates.env` — Java service variables (DB credentials, HTTP endpoint). See [Configuration](#configuration).
+- `/etc/gates/ms-gates.env` — Java service variables (local/remote/catalog DB credentials, reader tribune, HTTP endpoint). See [Configuration](#configuration).
 
 Permissions for the credentials file:
 
