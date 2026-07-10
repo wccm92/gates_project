@@ -33,8 +33,6 @@ public class CompositeVisitorRepository implements VisitorRepositoryPort {
     @Override
     public void updateEstado(Visitante visitante, String estado) {
         local.updateEstado(visitante, estado);
-        log.info("[S002] estado actualizado a '1' en DB local — credential={}",
-                visitante.idVisitante());
         try {
             remote.updateEstado(visitante, estado);
         } catch (RuntimeException e) {
