@@ -23,5 +23,7 @@ app:
       base-url: ${ACCESS_BASE_URL:http://localhost:8080}
       path: ${ACCESS_PATH:/api/access}
       timeout-seconds: ${ACCESS_TIMEOUT_SECONDS:5}
+      username: ${ACCESS_USERNAME:root}
+      password: ${ACCESS_PASSWORD:root}
   reader:
     id-tribuna: ${READER_ID_TRIBUNA:tribune}
