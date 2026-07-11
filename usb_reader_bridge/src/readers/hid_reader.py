@@ -1,6 +1,7 @@
 import logging
 import sys
-from typing import Iterator, Optional
+from selectors import DefaultSelector, EVENT_READ
+from typing import Iterator, List, Optional
 
 from .base import BaseReader
 
@@ -36,10 +37,45 @@ def _build_key_map() -> dict:
     }
 
 
+class _LineDecoder:
+    """
+    Per-device keystroke state machine.
+    Each connected reader keeps its own decoder so simultaneous scans from
+    different readers never get their characters interleaved: a line is only
+    emitted (whole) when that device sends ENTER.
+    """
+
+    def __init__(self, key_map: dict) -> None:
+        self._key_map = key_map
+        self._current: List[str] = []
+        self._shift_held = False
+
+    def feed(self, key_event, ecodes, KeyEvent) -> Optional[str]:
+        if key_event.scancode in (ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT):
+            self._shift_held = key_event.keystate != KeyEvent.key_up
+            return None
+
+        if key_event.keystate not in (KeyEvent.key_down, KeyEvent.key_hold):
+            return None
+
+        if key_event.scancode == ecodes.KEY_ENTER:
+            if self._current:
+                line = ''.join(self._current)
+                self._current.clear()
+                return line
+            return None
+
+        pair = self._key_map.get(key_event.scancode)
+        if pair:
+            self._current.append(pair[1] if self._shift_held else pair[0])
+        return None
+
+
 class HidReader(BaseReader):
     """
-    Reads from a USB HID keyboard-emulating reader via Linux evdev.
-    Grabs the device exclusively so scans do not type into other applications.
+    Reads from one or more USB HID keyboard-emulating readers via Linux evdev.
+    Grabs every matching device exclusively so scans do not type into other
+    applications, and multiplexes them into a single stream of scan lines.
 
     Requires the running user to be in the 'input' group on Linux:
         sudo usermod -aG input <user>
@@ -48,7 +84,7 @@ class HidReader(BaseReader):
 
     def __init__(
         self,
-        device_path: Optional[str] = None,
+        device_paths: Optional[List[str]] = None,
         vendor_id: Optional[int] = None,
         product_id: Optional[int] = None,
     ) -> None:
@@ -61,56 +97,60 @@ class HidReader(BaseReader):
         import evdev
         self._key_map = _build_key_map()
 
-        if device_path:
-            self._device = evdev.InputDevice(device_path)
+        if device_paths:
+            self._devices = [evdev.InputDevice(path) for path in device_paths]
         else:
-            self._device = _find_hid_device(evdev, vendor_id, product_id)
+            self._devices = _find_hid_devices(evdev, vendor_id, product_id)
 
-        self._device.grab()
-        logger.info("Grabbed HID device: %s  name=%s", self._device.path, self._device.name)
+        for dev in self._devices:
+            dev.grab()
+            logger.info("Grabbed HID device: %s  name=%s", dev.path, dev.name)
+        logger.info("Listening on %d HID device(s)", len(self._devices))
 
     def read_lines(self) -> Iterator[str]:
         from evdev import categorize, ecodes, KeyEvent
 
-        current: list[str] = []
-        shift_held = False
+        selector = DefaultSelector()
+        decoders = {}
+        for dev in self._devices:
+            selector.register(dev, EVENT_READ)
+            decoders[dev.path] = _LineDecoder(self._key_map)
 
-        for event in self._device.read_loop():
-            if event.type != ecodes.EV_KEY:
-                continue
+        while selector.get_map():
+            for key, _mask in selector.select():
+                device = key.fileobj
+                decoder = decoders[device.path]
+                try:
+                    events = list(device.read())
+                except OSError as exc:
+                    # Device unplugged / read error: drop it and keep the rest alive.
+                    logger.error("HID device %s read error: %s", device.path, exc)
+                    selector.unregister(device)
+                    continue
 
-            key_event = categorize(event)
+                for event in events:
+                    if event.type != ecodes.EV_KEY:
+                        continue
+                    line = decoder.feed(categorize(event), ecodes, KeyEvent)
+                    if line:
+                        yield line
 
-            if key_event.scancode in (ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT):
-                shift_held = key_event.keystate != KeyEvent.key_up
-                continue
-
-            if key_event.keystate not in (KeyEvent.key_down, KeyEvent.key_hold):
-                continue
-
-            if key_event.scancode == ecodes.KEY_ENTER:
-                if current:
-                    yield ''.join(current)
-                    current.clear()
-                continue
-
-            pair = self._key_map.get(key_event.scancode)
-            if pair:
-                current.append(pair[1] if shift_held else pair[0])
+        logger.error("All HID devices disconnected; stopping HID reader")
 
     def close(self) -> None:
-        try:
-            self._device.ungrab()
-            self._device.close()
-            logger.info("HID device released")
-        except Exception:
-            pass
+        for dev in getattr(self, '_devices', []):
+            try:
+                dev.ungrab()
+                dev.close()
+            except Exception:
+                pass
+        logger.info("HID device(s) released")
 
 
-def _find_hid_device(evdev_module, vendor_id: Optional[int], product_id: Optional[int]):
+def _find_hid_devices(evdev_module, vendor_id: Optional[int], product_id: Optional[int]) -> list:
     from evdev import InputDevice, ecodes
 
-    candidates = []
+    matches = []
     for path in evdev_module.list_devices():
         try:
             dev = InputDevice(path)
@@ -121,18 +161,19 @@ def _find_hid_device(evdev_module, vendor_id: Optional[int], product_id: Optiona
         if ecodes.EV_KEY not in caps:
             continue
 
-        # If VID+PID are specified, match exactly and return immediately.
+        # If VID+PID are specified, collect every device that matches them
+        # (multiple identical readers share the same VID/PID).
         if vendor_id is not None and product_id is not None:
             if dev.info.vendor == vendor_id and dev.info.product == product_id:
-                return dev
+                matches.append(dev)
             continue
 
-        # Heuristic: device that has digit keys and Enter is likely a reader.
+        # Heuristic: a device that has digit keys and Enter is likely a reader.
         keys = caps.get(ecodes.EV_KEY, [])
         if ecodes.KEY_ENTER in keys and ecodes.KEY_1 in keys:
-            candidates.append(dev)
+            matches.append(dev)
 
-    if not candidates:
+    if not matches:
         raise RuntimeError(
             "No HID keyboard device found. "
             "Options:\n"
@@ -141,11 +182,11 @@ def _find_hid_device(evdev_module, vendor_id: Optional[int], product_id: Optiona
             "  - Check group permissions: sudo usermod -aG input $USER"
         )
 
-    if len(candidates) > 1:
+    if vendor_id is None or product_id is None:
         logger.warning(
-            "%d HID keyboard devices found; using first: %s. "
-            "Set READER_HID_DEVICE or READER_HID_VID/PID to be explicit.",
-            len(candidates), candidates[0].path,
+            "%d HID keyboard device(s) matched by heuristic: %s. "
+            "This may include a real keyboard; set READER_HID_VID/PID to pin your readers.",
+            len(matches), ", ".join(d.path for d in matches),
         )
 
-    return candidates[0]
+    return matches

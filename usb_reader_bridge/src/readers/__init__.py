@@ -44,8 +44,10 @@ def _build_serial(config: Config) -> BaseReader:
 
 def _build_hid(config: Config) -> BaseReader:
     from .hid_reader import HidReader
+    # READER_HID_DEVICE may hold several comma-separated paths for multiple readers.
+    paths = [p.strip() for p in config.hid_device_path.split(',') if p.strip()]
     return HidReader(
-        device_path=config.hid_device_path or None,
+        device_paths=paths or None,
         vendor_id=config.hid_vendor_id,
         product_id=config.hid_product_id,
     )
