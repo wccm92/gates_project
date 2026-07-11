@@ -45,7 +45,7 @@ The bridge has four reader modes, selected via the `READER_MODE` env var:
 |---|---|---|
 | `simulate` | stdin — type or pipe lines manually | Linux, macOS, Windows |
 | `serial` | `/dev/ttyUSB*` or `/dev/ttyACM*` via `pyserial` | Linux, macOS |
-| `hid` | `/dev/input/eventX` via `evdev` | Linux only |
+| `hid` | one or more `/dev/input/eventX` via `evdev` | Linux only |
 | `auto` | serial first, HID fallback; simulate on non-Linux | Linux (all modes), macOS (simulate only) |
 
 In every mode the bridge writes one line per scan to **stdout** and all logs to **stderr**, making it safely pipeable.
@@ -489,6 +489,14 @@ READER_HID_DEVICE=/dev/input/event3 \
 python3 -u src/main.py
 ```
 
+For **several readers** you can pin them all by listing their paths comma-separated:
+
+```bash
+READER_MODE=hid \
+READER_HID_DEVICE=/dev/input/event3,/dev/input/event5 \
+python3 -u src/main.py
+```
+
 #### Run with VID/PID (survives device re-enumeration)
 
 ```bash
@@ -498,13 +506,19 @@ READER_HID_PID=0x1200 \
 python3 -u src/main.py
 ```
 
+When your readers are all the **same model** (same VID/PID), this grabs **every** matching device automatically — no need to list each `eventX`. This is the recommended way to run multiple identical readers.
+
 #### Run with auto-detection (convenient, not for production)
 
 ```bash
 READER_MODE=hid python3 -u src/main.py
 ```
 
-The bridge picks the first input device that has digit keys and Enter — usually correct if your reader is the only non-keyboard HID device connected.
+The bridge grabs **every** input device that has digit keys and Enter. This may include a real keyboard, so it prints a warning; pin your readers with `READER_HID_VID/PID` (or `READER_HID_DEVICE`) for a deterministic set.
+
+#### Multiple readers
+
+In `hid` mode the bridge reads from **all** selected devices at once and multiplexes their scans into a single stdout stream. Each reader keeps its own line buffer, so two people scanning at the same time on different readers never mix characters — every line is emitted whole when its reader sends Enter. Startup logs show one `Grabbed HID device: …` line per reader followed by `Listening on N HID device(s)`. If one reader is unplugged mid-run, it is dropped and the remaining readers keep working.
 
 Scan a card. Expected stdout:
 
@@ -635,11 +649,14 @@ LOG_LEVEL=DEBUG READER_MODE=simulate python3 -u src/main.py
 | `INFO` | `Starting USB reader bridge [mode=…]` | bridge started successfully |
 | `INFO` | `Simulator: reading from stdin` | simulate mode active |
 | `INFO` | `Opening serial device … at … baud` | serial port opened |
-| `INFO` | `Grabbed HID device: … name=…` | HID device claimed exclusively |
+| `INFO` | `Grabbed HID device: … name=…` | HID device claimed exclusively (one line per reader) |
+| `INFO` | `Listening on N HID device(s)` | number of readers being read simultaneously |
 | `INFO` | `Auto-detected serial device: …` | auto mode picked serial |
 | `DEBUG` | `Forwarding line [length=…]` | one scan forwarded (verbose mode) |
 | `WARNING` | `Auto-detect is Linux-only. Falling back to simulate` | running on macOS/Windows |
-| `WARNING` | `%d HID keyboard devices found; using first: …` | ambiguous auto-detect |
+| `WARNING` | `%d HID keyboard device(s) matched by heuristic: …` | no VID/PID pinned; may include a keyboard |
+| `ERROR` | `HID device … read error: …` | a reader was unplugged; it is dropped, others continue |
+| `ERROR` | `All HID devices disconnected; stopping HID reader` | every reader was lost |
 | `ERROR` | `Serial read error: …` | serial IO failure, bridge will exit |
 | `INFO` | `Serial port closed` / `HID device released` | clean shutdown |
 | `INFO` | `USB reader bridge stopped` | process exiting cleanly |
@@ -876,14 +893,21 @@ The key map in `hid_reader.py` assumes a US keyboard layout. If your reader send
 
 Missing group membership. Run `groups $USER` and check for `dialout` (serial) or `input` (HID). Add with `sudo usermod -aG <group> $USER` and log out/in.
 
-### Multiple HID keyboard devices found warning
+### Multiple HID devices matched by heuristic warning
 
-The auto-detect heuristic picked the first keyboard-like device. Pin the exact device:
+Without a pinned VID/PID the bridge grabs every keyboard-like device, which can include a real keyboard. Pin the exact readers instead:
 
 ```bash
-# Find your reader:
-sudo evtest   # look for the reader by name
+# Find your readers:
+sudo evtest   # look for the readers by name
 
-# Then set explicitly:
-READER_HID_DEVICE=/dev/input/event3 READER_MODE=hid python3 -u src/main.py
+# Same-model readers — pin by VID/PID (grabs all of them):
+READER_MODE=hid READER_HID_VID=0x05e0 READER_HID_PID=0x1200 python3 -u src/main.py
+
+# Or list explicit device paths (comma-separated for several readers):
+READER_MODE=hid READER_HID_DEVICE=/dev/input/event3,/dev/input/event5 python3 -u src/main.py
 ```
+
+### Only one of several readers is recognized
+
+Make sure you are on a build that supports multiple readers (grabs all VID/PID matches and multiplexes them). On startup you should see one `Grabbed HID device: …` line **per reader** and `Listening on N HID device(s)`. If `N` is lower than the number of readers connected, check permissions (`groups $USER` must include `input`) and that each reader appears under `sudo evtest`.
