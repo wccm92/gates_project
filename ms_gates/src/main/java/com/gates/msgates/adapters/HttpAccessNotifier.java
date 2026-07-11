@@ -17,7 +17,8 @@ public class HttpAccessNotifier implements AccessNotifierPort {
     private static final Logger log = LoggerFactory.getLogger(HttpAccessNotifier.class);
 
     /** Fixed tail appended after the idPort — e.g. action=<idPort>:/1000 */
-    private static final String PORT_SUFFIX = ":/1000";
+    private static final String PORT_SUFFIX = ":/1000%5C";
+
 
     private final RestClient restClient;
     private final String baseUrl;
