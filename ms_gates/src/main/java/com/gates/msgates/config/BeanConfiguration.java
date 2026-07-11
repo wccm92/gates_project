@@ -11,6 +11,13 @@ import com.gates.msgates.domain.usecase.port.AccessNotifierPort;
 import com.gates.msgates.domain.usecase.port.CredentialPublisherPort;
 import com.gates.msgates.domain.usecase.port.ReaderCachePort;
 import com.gates.msgates.domain.usecase.port.VisitorRepositoryPort;
+import org.apache.hc.client5.http.auth.AuthScope;
+import org.apache.hc.client5.http.auth.UsernamePasswordCredentials;
+import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.impl.auth.BasicCredentialsProvider;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.core5.util.Timeout;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.jdbc.DataSourceBuilder;
@@ -18,6 +25,7 @@ import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.web.client.RestClient;
@@ -138,12 +146,31 @@ public class BeanConfiguration {
         return new CheckAccessUseCase(repository, notifier, readerCachePort, eventPublisher);
     }
 
-    // --- HTTP client ---
+    // --- HTTP client (Apache HttpClient 5 with Digest auth) ---
 
     @Bean
     public RestClient accessRestClient(AccessHttpProperties props) {
+        BasicCredentialsProvider credentialsProvider = new BasicCredentialsProvider();
+        credentialsProvider.setCredentials(
+                new AuthScope(null, -1),
+                new UsernamePasswordCredentials(props.username(), props.password().toCharArray()));
+
+        Timeout timeout = Timeout.ofSeconds(props.timeoutSeconds());
+        RequestConfig requestConfig = RequestConfig.custom()
+                .setConnectTimeout(timeout)
+                .setResponseTimeout(timeout)
+                .build();
+
+        CloseableHttpClient httpClient = HttpClients.custom()
+                .setDefaultCredentialsProvider(credentialsProvider)
+                .setDefaultRequestConfig(requestConfig)
+                .build();
+
+        HttpComponentsClientHttpRequestFactory factory =
+                new HttpComponentsClientHttpRequestFactory(httpClient);
+
         return RestClient.builder()
-                .baseUrl(props.baseUrl())
+                .requestFactory(factory)
                 .defaultHeader("X-Service", "ms-gates")
                 .build();
     }

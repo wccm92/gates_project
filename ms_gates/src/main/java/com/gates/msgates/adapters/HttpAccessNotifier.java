@@ -4,35 +4,39 @@ import com.gates.msgates.config.AccessHttpProperties;
 import com.gates.msgates.domain.usecase.port.AccessNotifierPort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.HttpStatusCodeException;
 import org.springframework.web.client.RestClient;
+
+import java.net.URI;
 
 @Component
 public class HttpAccessNotifier implements AccessNotifierPort {
 
     private static final Logger log = LoggerFactory.getLogger(HttpAccessNotifier.class);
 
+    /** Fixed tail appended after the idPort — e.g. action=<idPort>:/1000 */
+    private static final String PORT_SUFFIX = ":/1000";
+
     private final RestClient restClient;
+    private final String baseUrl;
     private final String path;
 
     public HttpAccessNotifier(RestClient accessRestClient, AccessHttpProperties props) {
         this.restClient = accessRestClient;
+        this.baseUrl = props.baseUrl();
         this.path = props.path();
     }
 
     @Override
     public int notify(String idPort) {
-        String body = "{\"id_port\":\"" + idPort + "\"}";
-        log.debug("Sending HTTP access notification — path={}, body={}", path, body);
+        // e.g. http://172.22.30.74/axis-cgi/io/port.cgi?action=1:/1000
+        URI uri = URI.create(baseUrl + path + idPort + PORT_SUFFIX);
+        log.debug("Sending HTTP access notification (GET) — uri={}", uri);
         try {
-            ResponseEntity<Void> response = restClient.post()
-                    .uri(path)
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .header("X-Source", "ms-gates")
-                    .body(body)
+            ResponseEntity<Void> response = restClient.get()
+                    .uri(uri)
                     .retrieve()
                     .toBodilessEntity();
             int status = response.getStatusCode().value();
