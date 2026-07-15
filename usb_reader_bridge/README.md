@@ -87,7 +87,7 @@ All configuration is done through environment variables. For local development, 
 | Variable | Default | Description |
 |---|---|---|
 | `READER_MODE` | `auto` | `auto` / `hid` / `serial` / `simulate` |
-| `READER_SERIAL_DEVICE` | _(auto-detect)_ | Serial device path, e.g. `/dev/ttyUSB0` |
+| `READER_SERIAL_DEVICE` | _(auto-detect)_ | Serial device path, e.g. `/dev/ttyUSB0` or `COM3`. Comma-separate several for multiple readers: `COM3,COM4` |
 | `READER_SERIAL_BAUD` | `9600` | Serial baud rate |
 | `READER_HID_DEVICE` | _(auto-detect)_ | HID device path, e.g. `/dev/input/event3` |
 | `READER_HID_VID` | _(any)_ | HID vendor ID in hex, e.g. `0x05e0` |
@@ -409,6 +409,18 @@ Scan a card. Expected stdout (one line per scan, exactly as the reader sends it)
 ```
 EVENT|CARD|12345678|DOOR-01
 ```
+
+#### Multiple serial readers
+
+When several serial/CDC readers are connected (each is its own `COM`/`tty` port), list them comma-separated in `READER_SERIAL_DEVICE`:
+
+```bash
+READER_MODE=serial \
+READER_SERIAL_DEVICE=COM3,COM4,COM5,COM6,COM7,COM8 \
+python3 -u src/main.py
+```
+
+The bridge opens all of them (`MultiSerialReader`), runs one reader thread per port and multiplexes their scans into a single stdout stream — each reader keeps its own line buffer, so two people scanning at the same time never interleave characters. Startup logs show one `Opened serial device …` line per reader followed by `Listening on N serial device(s)`. If one reader is unplugged mid-run it is dropped and the rest keep working; when every reader is gone the bridge exits (and systemd/NSSM restarts it). A single path still uses the simpler `SerialReader`, so existing setups are unchanged.
 
 #### Baud rate mismatch
 

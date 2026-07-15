@@ -32,12 +32,21 @@ def build_reader(config: Config) -> BaseReader:
 # --- private helpers ---------------------------------------------------------
 
 def _build_serial(config: Config) -> BaseReader:
-    from .serial_reader import SerialReader
-    device = config.serial_device or _detect_serial_device()
+    from .serial_reader import MultiSerialReader, SerialReader
+
+    # READER_SERIAL_DEVICE may hold several comma-separated ports for multiple
+    # readers, e.g. "COM3,COM4,COM5" (Windows) or "/dev/ttyUSB0,/dev/ttyUSB1".
+    devices = [d.strip() for d in config.serial_device.split(',') if d.strip()]
+
+    if len(devices) > 1:
+        return MultiSerialReader(devices, config.serial_baud)
+
+    device = (devices[0] if devices else '') or _detect_serial_device()
     if not device:
         raise RuntimeError(
             "No serial device found. "
-            "Plug in the reader or set READER_SERIAL_DEVICE=/dev/ttyUSB0."
+            "Plug in the reader or set READER_SERIAL_DEVICE=/dev/ttyUSB0 "
+            "(or a comma-separated list like COM3,COM4 for several readers)."
         )
     return SerialReader(device, config.serial_baud)
 

@@ -6,7 +6,7 @@ from typing import Optional
 @dataclass
 class Config:
     reader_mode: str = 'auto'       # auto | hid | serial | simulate
-    serial_device: str = ''         # e.g. /dev/ttyUSB0 or /dev/ttyACM0
+    serial_device: str = ''         # e.g. /dev/ttyUSB0, COM3; comma-separated for several readers (COM3,COM4)
     serial_baud: int = 9600
     hid_device_path: str = ''       # e.g. /dev/input/event3 (optional, skips auto-detect)
     hid_vendor_id: Optional[int] = None   # hex or decimal, e.g. 0x05e0
