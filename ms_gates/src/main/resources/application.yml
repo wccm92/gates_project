@@ -26,4 +26,4 @@ app:
       username: ${ACCESS_USERNAME:root}
       password: ${ACCESS_PASSWORD:root}
   reader:
-    id-tribuna: ${READER_ID_TRIBUNA:tribune}
+    id-tribuna: ${READER_ID_TRIBUNA:1}
