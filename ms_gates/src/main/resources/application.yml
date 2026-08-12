@@ -19,6 +19,7 @@ app:
       username: ${CATALOG_DB_USERNAME:postgres}
       password: ${CATALOG_DB_PASSWORD:postgres}
   access:
+    mock: ${ACCESS_MOCK:false}
     http:
       base-url: ${ACCESS_BASE_URL:http://localhost:8080}
       path: ${ACCESS_PATH:/api/access}
