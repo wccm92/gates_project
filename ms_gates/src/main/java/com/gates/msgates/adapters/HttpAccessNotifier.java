@@ -4,6 +4,7 @@ import com.gates.msgates.config.AccessHttpProperties;
 import com.gates.msgates.domain.usecase.port.AccessNotifierPort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.HttpStatusCodeException;
@@ -12,6 +13,7 @@ import org.springframework.web.client.RestClient;
 import java.net.URI;
 
 @Component
+@ConditionalOnProperty(name = "app.access.mock", havingValue = "false", matchIfMissing = true)
 public class HttpAccessNotifier implements AccessNotifierPort {
 
     private static final Logger log = LoggerFactory.getLogger(HttpAccessNotifier.class);
