@@ -13,9 +13,9 @@ public class RemoteJdbcVisitorRepository {
         this.table = table;
     }
 
-    public void updateEstado(Visitante visitante, String estado) {
-        String sql = "UPDATE " + table + " SET estado = ? " +
+    public void updateEstado(Visitante visitante, String estado, String obsingreso) {
+        String sql = "UPDATE " + table + " SET estado = ?, obsingreso = ? " +
                      "WHERE id_visitante = ? AND id_evento = ?";
-        jdbc.update(sql, estado, visitante.idVisitante(), visitante.idEvento());
+        jdbc.update(sql, estado, obsingreso, visitante.idVisitante(), visitante.idEvento());
     }
 }

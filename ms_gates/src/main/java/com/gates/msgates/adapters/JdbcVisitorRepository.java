@@ -5,10 +5,18 @@ import com.gates.msgates.domain.model.Visitante;
 import com.gates.msgates.domain.usecase.port.VisitorRepositoryPort;
 import org.springframework.jdbc.core.JdbcTemplate;
 
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Optional;
 
 public class JdbcVisitorRepository implements VisitorRepositoryPort {
+
+    /** Colombia local time (GMT-5, no DST) used to stamp obsingreso. */
+    private static final ZoneId ZONA_COLOMBIA = ZoneId.of("America/Bogota");
+    private static final DateTimeFormatter OBSINGRESO_FORMAT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     private final JdbcTemplate jdbc;
     private final String table;
@@ -39,8 +47,13 @@ public class JdbcVisitorRepository implements VisitorRepositoryPort {
 
     @Override
     public void updateEstado(Visitante visitante, String estado) {
-        String sql = "UPDATE " + table + " SET estado = ? " +
+        updateEstado(visitante, estado,
+                LocalDateTime.now(ZONA_COLOMBIA).format(OBSINGRESO_FORMAT) + "M");
+    }
+
+    public void updateEstado(Visitante visitante, String estado, String obsingreso) {
+        String sql = "UPDATE " + table + " SET estado = ?, obsingreso = ? " +
                      "WHERE id_visitante = ? AND id_evento = ?";
-        jdbc.update(sql, estado, visitante.idVisitante(), visitante.idEvento());
+        jdbc.update(sql, estado, obsingreso, visitante.idVisitante(), visitante.idEvento());
     }
 }
