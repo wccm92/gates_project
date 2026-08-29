@@ -1,0 +1,20 @@
+# Rotación de los logs recolectados de gates-pipeline.
+# Instalar en: /etc/logrotate.d/gates-logs
+#
+# En postrotate se reinicia el recolector: gracias a --cursor-file retoma
+# exactamente donde quedó y sigue escribiendo en el archivo nuevo, sin perder
+# ni duplicar líneas (a diferencia de copytruncate, que tiene una condición de
+# carrera y puede perder líneas durante la copia).
+
+/var/log/gates/*.log {
+    daily
+    rotate 30
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 root root
+    postrotate
+        systemctl restart gates-log-collector.service >/dev/null 2>&1 || true
+    endscript
+}

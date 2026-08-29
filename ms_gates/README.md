@@ -28,6 +28,7 @@ Java microservice that powers turnstile access control. Reads pipe/backtick-deli
 - [Input contract](#input-contract)
 - [Database contract](#database-contract)
 - [Production deployment notes](#production-deployment-notes)
+  - [Persisting & exporting logs (log collector)](#persisting--exporting-logs-log-collector)
 
 ---
 
@@ -751,6 +752,46 @@ View live logs:
 ```bash
 sudo journalctl -u gates-pipeline -f
 ```
+
+> `journalctl -f` is live-only: closing the console or restarting the service loses the scrollback, and by default journald is volatile (wiped on reboot). To keep an exportable record, use the log collector below.
+
+### Persisting & exporting logs (log collector)
+
+A separate, self-contained systemd service — **`gates-log-collector`** — follows the `gates-pipeline` journal and appends every line to a persistent plain-text file, so logs survive console close, service restart and reboot, and can be exported later. It lives in `deploy/logging/` (at the `gates_project` root, since it covers the whole Python + Java pipeline, not just this Java service).
+
+**How it stays reliable:** the collector runs `journalctl -u gates-pipeline -o short-iso -n all --follow --cursor-file=…`. The `--cursor-file` makes it resume **exactly** where it left off after any restart — no lost or duplicated lines. `logrotate` rotates the file daily (30 days kept, compressed); its `postrotate` restarts the collector so rotation is also lossless (the cursor guarantees continuity).
+
+Output file:
+
+```
+/var/log/gates/gates-pipeline.log
+```
+
+**Install** (run on each Linux machine where the pipeline is deployed):
+
+```bash
+cd deploy/logging
+sudo ./install.sh
+```
+
+This installs the scripts, the systemd unit and the logrotate rule, then enables and starts the collector (auto-starts on boot).
+
+**Tail the persisted file** (equivalent to `journalctl -f`, but already saved to disk):
+
+```bash
+tail -f /var/log/gates/gates-pipeline.log
+```
+
+**Export** all history (current file + rotated `.gz`) into a single chronological `.txt`:
+
+```bash
+gates-logs-export.sh                 # -> ~/gates-pipeline-YYYYmmdd-HHMMSS.txt
+gates-logs-export.sh /tmp/logs.txt   # explicit path
+# then copy it off the box, e.g.:
+scp user@machine:/tmp/logs.txt .
+```
+
+**Configurable** via environment variables in `gates-log-collector.service` (`GATES_UNIT`, `GATES_LOG_DIR`, `GATES_STATE_DIR`) and retention in `/etc/logrotate.d/gates-logs`. Requires systemd ≥ 245 (for `--cursor-file`). See `deploy/logging/README.md` for full details, including the optional hardening to make journald itself persistent.
 
 ### Environment files
 

@@ -1,0 +1,22 @@
+[Unit]
+Description=Recolector de logs de gates-pipeline a archivo de texto plano
+Documentation=file:///opt/gates/deploy/logging/README.md
+After=gates-pipeline.service systemd-journald.service
+Wants=systemd-journald.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gates-log-collector.sh
+Restart=always
+RestartSec=2
+
+# Unit a seguir y rutas de salida (ajústalas si tu despliegue difiere)
+Environment=GATES_UNIT=gates-pipeline
+Environment=GATES_LOG_DIR=/var/log/gates
+Environment=GATES_STATE_DIR=/var/lib/gates-log-collector
+
+# Corre como root para poder leer el journal completo del sistema.
+# (Alternativa sin root: User=gates + SupplementaryGroups=systemd-journal)
+
+[Install]
+WantedBy=multi-user.target
