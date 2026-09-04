@@ -1,0 +1,20 @@
+[Unit]
+Description=EDC · Sincronización de invitados por tribuna (nube -> local)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Usuario del sistema con el que corre el servicio:
+User=gates
+WorkingDirectory=/opt/edc-sync
+EnvironmentFile=/opt/edc-sync/.env
+ExecStart=/opt/edc-sync/.venv/bin/python /opt/edc-sync/sync_tribuna.py
+Restart=always
+RestartSec=10
+# Cierre limpio: el servicio atiende SIGTERM y termina tras el ciclo actual.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
