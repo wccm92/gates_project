@@ -1,20 +1,35 @@
+# Plantilla del unit de systemd para el servicio de sync.
+#
+# NO se copia tal cual: los marcadores __SERVICE_USER__ y __REPO_DIR__ se
+# sustituyen al instalarlo, porque la ruta del repo depende del usuario de
+# cada máquina (ver sync/DESPLIEGUE.md, Paso 5.1):
+#
+#   sudo sed -e "s|__SERVICE_USER__|$USER|g" \
+#            -e "s|__REPO_DIR__|$REPO_DIR|g" \
+#            "$REPO_DIR/sync/service/edc-sync.service" \
+#            > /etc/systemd/system/edc-sync.service
+
 [Unit]
 Description=EDC · Sincronización de invitados por tribuna (nube -> local)
+Documentation=file://__REPO_DIR__/sync/DESPLIEGUE.md
 After=network-online.target postgresql.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-# Usuario del sistema con el que corre el servicio:
-User=gates
-WorkingDirectory=/opt/edc-sync
-EnvironmentFile=/opt/edc-sync/.env
-ExecStart=/opt/edc-sync/.venv/bin/python /opt/edc-sync/sync_tribuna.py
+# Usuario dueño del repo clonado (edc-occidental / edc-oriental):
+User=__SERVICE_USER__
+# El servicio corre DESDE el repo: 'git pull' + restart lo actualiza.
+WorkingDirectory=__REPO_DIR__/sync/service
+EnvironmentFile=/etc/gates/edc-sync.env
+ExecStart=__REPO_DIR__/sync/service/.venv/bin/python -u __REPO_DIR__/sync/service/sync_tribuna.py
 Restart=always
 RestartSec=10
 # Cierre limpio: el servicio atiende SIGTERM y termina tras el ciclo actual.
 KillSignal=SIGTERM
 TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

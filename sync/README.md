@@ -136,35 +136,51 @@ reflejarse en todos los amparados de ese par.
 
 ### 2. En cada MÁQUINA LOCAL
 
-```bash
-# a) Crear el esquema local
-psql -d edc_local -f sync/schema_local/01_invitados.sql
+El repositorio ya está clonado en cada máquina (`~/Documentos/gates_project`),
+así que **no hay que transferir archivos**: el servicio corre *desde el repo*
+y se actualiza con `git pull` + `systemctl restart`.
 
-# b) Instalar el servicio
-sudo mkdir -p /opt/edc-sync
-sudo cp sync/service/sync_tribuna.py /opt/edc-sync/
-python3 -m venv /opt/edc-sync/.venv
-/opt/edc-sync/.venv/bin/pip install -r sync/service/requirements.txt
+```bash
+export REPO_DIR="$HOME/Documentos/gates_project"
+cd "$REPO_DIR" && git pull
+
+# a) Crear el esquema local
+psql -d bdmolinetesnodo1 -f sync/schema_local/01_invitados.sql
+
+# b) Entorno virtual DENTRO del repo (sin sudo: debe ser de tu usuario)
+cd "$REPO_DIR/sync/service"
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 
 # c) Configurar (¡aquí se define la tribuna de ESTA máquina!)
-sudo cp sync/service/.env.example /opt/edc-sync/.env
-sudo nano /opt/edc-sync/.env       # ajustar credenciales y TRIBUNA_ID
+sudo mkdir -p /etc/gates
+sudo cp .env.example /etc/gates/edc-sync.env
+sudo chmod 600 /etc/gates/edc-sync.env
+sudo nano /etc/gates/edc-sync.env   # ajustar credenciales y TRIBUNA_ID
 
-# d) Arrancar como servicio
-sudo cp sync/service/edc-sync.service /etc/systemd/system/
+# d) Instalar el unit (la plantilla lleva marcadores que se sustituyen aquí)
+sudo sed -e "s|__SERVICE_USER__|$USER|g" -e "s|__REPO_DIR__|$REPO_DIR|g" \
+    "$REPO_DIR/sync/service/edc-sync.service" > /etc/systemd/system/edc-sync.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now edc-sync
 sudo journalctl -u edc-sync -f     # ver logs en vivo
 ```
 
+Paso a paso, con verificaciones y solución de problemas: **`DESPLIEGUE.md`**.
+
 Para probar sin systemd:
 
 ```bash
-cd sync/service
-python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-set -a; . ./.env; set +a
-python sync_tribuna.py
+cd "$REPO_DIR/sync/service"
+set -a; . <(sudo cat /etc/gates/edc-sync.env); set +a
+.venv/bin/python sync_tribuna.py
+```
+
+Para actualizar tras un cambio:
+
+```bash
+cd "$REPO_DIR" && git pull
+sudo systemctl restart edc-sync
 ```
 
 ## Configuración (variables de entorno)

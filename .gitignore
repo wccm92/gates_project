@@ -4,3 +4,8 @@
 # Python
 __pycache__/
 *.py[cod]
+
+# Entornos virtuales y configuración con secretos (viven en la máquina,
+# no en el repo). Las plantillas .env.example sí se versionan.
+.venv/
+.env
