@@ -55,21 +55,36 @@ Dos caminos complementarios:
   `lower(estado) = 'activo'`). Si un evento se activa después, el próximo
   `reconcile` trae todos sus registros; si se desactiva, la poda los
   retira de los nodos (salvo los ya ingresados).
-- **`estado` y `obsingreso` son de dominio 100% LOCAL**: los gestiona el
-  servicio de puerta (Python/Java) de cada máquina. La nube **nunca** los
-  lee ni los escribe:
-    - El trigger **no emite evento** cuando un UPDATE cambia *solo*
-      `estado` y/o `obsingreso` (además, son los cambios más frecuentes en
-      control de acceso → outbox liviano).
-    - El `UPSERT` **no incluye** las columnas `estado` ni `obsingreso`: las
-      altas nuevas nacen en `NULL` (= "no ingresado" en local) y las filas
-      existentes nunca se tocan en esas columnas (ni en poll ni en
-      reconcile).
-    - En un cambio mixto (p. ej. `estado` + `id_suite`), se sincronizan
-      los demás campos y `estado`/`obsingreso` se ignoran.
-    - Reparto de columnas sin solape: este servicio escribe `id_suite`,
-      `sincronizado` (y crea filas); el servicio de puerta escribe `estado`
-      y `obsingreso`.
+- **`estado` y `obsingreso` tienen dos escritores, resueltos por
+  procedencia**: los marca el servicio de puerta de cada máquina, pero en
+  la nube también los escriben **componentes externos** a este despliegue.
+  Esos ingresos externos el nodo no los conoce por ninguna otra vía, así
+  que sí deben bajar. El origen se distingue por el formato de
+  `obsingreso`:
+
+  | Origen | Formato | ¿Baja al nodo? |
+  |---|---|---|
+  | Nodo (`ms_gates`) | `2026-09-26 10:28:18M` (sufijo `M`) | **No** |
+  | Externo | `2026-09-26T10:16:42-05:00` (ISO) | **Sí** |
+
+    - El **trigger** resuelve la procedencia en la nube y la deja escrita
+      en `cdc_outbox.aplica_estado`; el consumidor no infiere nada del
+      texto. Sigue **sin emitir evento** cuando el cambio de
+      `estado`/`obsingreso` salió de un nodo: el nodo ya lo aplicó en
+      local antes de subirlo, así que devolvérselo solo sería eco (y son
+      los cambios más frecuentes en control de acceso → outbox liviano).
+    - El **poll** aplica `estado`/`obsingreso` tal cual, `NULL` incluido,
+      cuando `aplica_estado` es true: un `NULL` ahí es una reversión
+      deliberada de un externo.
+    - El **reconcile** solo **rellena, nunca borra**: aplica los ingresos
+      que en el snapshot tienen origen externo y deja intacto el resto. La
+      asimetría es deliberada — el snapshot no distingue "un externo
+      revirtió el ingreso" de "el nodo lo marcó y su escritura a la nube
+      falló" (`CompositeVisitorRepository` registra `[E006]` y sigue
+      adelante), y tomar ese `NULL` como verdad borraría un ingreso válido
+      y dejaría reentrar a esa persona. Ante la duda, gana el nodo.
+    - Las altas nuevas siguen naciendo en `NULL` (= "no ingresado" en
+      local).
 - **Idempotente / entrega al menos una vez**: reprocesar un cambio no
   causa daño; por eso el orden es *aplicar en local → avanzar cursor* en
   la misma transacción local.
@@ -95,8 +110,9 @@ reflejarse en todos los amparados de ese par.
 - **Trigger dedicado e independiente**: `trg_visitantexevento_amparado_sync`
   (`AFTER UPDATE`, función `fn_visitantexevento_amparado_sync`), en
   `schema_nube/06_amparadoxevento_sync.sql`. Es una pieza aparte del trigger
-  del outbox: aquel **descarta** los cambios de solo `estado`/`obsingreso`
-  (no interesan a los nodos), mientras que este reacciona **justo** a ellos.
+  del outbox: aquel descarta los cambios de `estado`/`obsingreso` que
+  **escribió un nodo** (los emite si vienen de un componente externo),
+  mientras que este reacciona a **todos** ellos, venga de donde venga.
   Ambos triggers conviven sobre `visitantexevento` sin pisarse.
 - **Se dispara solo si cambió `estado` u `obsingreso`** (`IS DISTINCT FROM`,
   null-safe). Propaga `NEW.estado`/`NEW.obsingreso` a **todas** las filas de

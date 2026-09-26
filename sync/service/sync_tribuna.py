@@ -89,10 +89,24 @@ RECONCILE_INTERVAL = _int_env("RECONCILE_INTERVAL", 300)  # segundos; 0 = off
 BATCH_SIZE = _int_env("BATCH_SIZE", 500)
 RETRY_BACKOFF = _int_env("RETRY_BACKOFF", 10)         # segundos tras un error
 
-# 'estado' y 'obsingreso' son de dominio totalmente LOCAL (los marca el
-# servicio de puerta): NO se leen ni se escriben desde la nube. Las altas
-# nuevas nacen en NULL (columnas omitidas en el INSERT) y las filas
-# existentes nunca se tocan en esas columnas (ni en poll ni en reconcile).
+# 'estado' y 'obsingreso' los gobierna el servicio de puerta local, pero
+# NO en exclusiva: en la nube también los escriben componentes externos a
+# este despliegue, y esos ingresos el nodo no los conoce por ninguna otra
+# vía. Por eso hay DOS sentencias:
+#
+#   UPSERT_SQL          - el caso normal: replica id_suite/sincronizado y
+#                         NO toca estado/obsingreso. Las altas nuevas nacen
+#                         en NULL (columnas omitidas en el INSERT) y las
+#                         filas existentes conservan su ingreso local.
+#   UPSERT_ESTADO_SQL   - además baja estado/obsingreso desde la nube. Solo
+#                         se usa cuando el origen es externo; la nube ya
+#                         resolvió esa procedencia (cdc_outbox.aplica_estado,
+#                         ver schema_nube/02_trigger.sql), así que aquí no
+#                         se infiere nada a partir del texto.
+#
+# Nunca se aplica el camino con estado para un cambio que salió de un nodo:
+# el nodo escribe primero en local y luego sube a la nube, así que su propio
+# eco solo podría pisar un ingreso más reciente.
 # NOTA: el texto SQL no debe contener '%' salvo los marcadores %s.
 UPSERT_SQL = """
     INSERT INTO invitados
@@ -101,6 +115,17 @@ UPSERT_SQL = """
     ON CONFLICT (id_visitante, id_evento) DO UPDATE SET
         id_suite     = EXCLUDED.id_suite,
         sincronizado = EXCLUDED.sincronizado
+"""
+
+UPSERT_ESTADO_SQL = """
+    INSERT INTO invitados
+        (id_visitante, id_evento, id_suite, sincronizado, estado, obsingreso)
+    VALUES (%s, %s, %s, %s, %s, %s)
+    ON CONFLICT (id_visitante, id_evento) DO UPDATE SET
+        id_suite     = EXCLUDED.id_suite,
+        sincronizado = EXCLUDED.sincronizado,
+        estado       = EXCLUDED.estado,
+        obsingreso   = EXCLUDED.obsingreso
 """
 
 # --------------------------------------------------------------------------
@@ -155,12 +180,14 @@ def set_cursor(local: psycopg.Connection, cur, last_id: int) -> None:
 def poll_outbox(remote: psycopg.Connection, local: psycopg.Connection) -> int:
     """Aplica los cambios pendientes del outbox. Devuelve cuántos aplicó."""
     total = 0
+    aplicados_estado = 0
     while _running:
         last_id = get_cursor(local)
         with remote.cursor() as rcur:
             rcur.execute(
                 """
-                SELECT id, id_visitante, id_evento, id_suite, sincronizado
+                SELECT id, id_visitante, id_evento, id_suite, sincronizado,
+                       estado, obsingreso, aplica_estado
                   FROM cdc_outbox
                  WHERE tribuna = %s AND id > %s
                  ORDER BY id
@@ -179,11 +206,22 @@ def poll_outbox(remote: psycopg.Connection, local: psycopg.Connection) -> int:
         # daño (entrega "al menos una vez").
         with local.cursor() as lcur:
             for r in rows:
-                _id, id_vis, id_evt, id_suite, sync = r
-                lcur.execute(
-                    UPSERT_SQL,
-                    (id_vis, id_evt, id_suite, sync),
-                )
+                (_id, id_vis, id_evt, id_suite, sync,
+                 estado, obsingreso, aplica_estado) = r
+                if aplica_estado:
+                    # Ingreso (o reversión) escrito en la nube por un
+                    # componente externo: el nodo no lo conoce, hay que
+                    # bajarlo tal cual, NULL incluido.
+                    lcur.execute(
+                        UPSERT_ESTADO_SQL,
+                        (id_vis, id_evt, id_suite, sync, estado, obsingreso),
+                    )
+                    aplicados_estado += 1
+                else:
+                    lcur.execute(
+                        UPSERT_SQL,
+                        (id_vis, id_evt, id_suite, sync),
+                    )
             set_cursor(local, lcur, rows[-1][0])
         local.commit()
 
@@ -192,7 +230,8 @@ def poll_outbox(remote: psycopg.Connection, local: psycopg.Connection) -> int:
             break
 
     if total:
-        log.info("Poll: %d cambios aplicados (tribuna %s)", total, TRIBUNA_ID)
+        log.info("Poll: %d cambios aplicados (tribuna %s; %d con estado de "
+                 "origen externo)", total, TRIBUNA_ID, aplicados_estado)
     return total
 
 
@@ -212,12 +251,25 @@ def reconcile(remote: psycopg.Connection, local: psycopg.Connection) -> int:
 
     SALVAGUARDA: si el snapshot de la nube viene vacío no se poda nada
     (un fallo transitorio no debe vaciar la tabla local).
+
+    ESTADO/OBSINGRESO — el reconcile solo RELLENA, nunca borra:
+    aplica los ingresos que en la nube tienen origen externo (obsingreso
+    sin la 'M' de ms_gates) y deja intacto todo lo demás. La asimetría
+    frente al poll es deliberada. El poll procesa eventos fechados: un
+    NULL ahí significa "un externo revirtió este ingreso" y se aplica. El
+    snapshot, en cambio, no distingue eso de "el nodo marcó el ingreso y
+    su escritura a la nube falló" (CompositeVisitorRepository registra
+    [E006] y sigue): tomar ese NULL como verdad borraría un ingreso
+    válido y dejaría reentrar a esa persona. Ante la duda, gana el nodo.
     """
     with remote.cursor() as rcur:
         rcur.execute(
             """
             SELECT ve.id_visitante, ve.id_evento, ve.id_suite,
-                   ve.sincronizado
+                   ve.sincronizado, ve.estado, ve.obsingreso,
+                   (ve.obsingreso IS NOT NULL
+                    AND rtrim(ve.obsingreso) <> ''
+                    AND right(rtrim(ve.obsingreso), 1) <> 'M') AS aplica_estado
               FROM visitantexevento ve
               JOIN suites  s ON s.id_suite = ve.id_suite
               JOIN eventos e ON e.id       = ve.id_evento
@@ -228,10 +280,18 @@ def reconcile(remote: psycopg.Connection, local: psycopg.Connection) -> int:
         )
         rows = rcur.fetchall()
 
+    # Las filas cuyo ingreso en la nube es de origen externo bajan con
+    # estado/obsingreso; el resto se aplica sin tocar esas columnas.
+    sin_estado = [(r[0], r[1], r[2], r[3]) for r in rows if not r[6]]
+    con_estado = [(r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows if r[6]]
+
     pruned = 0
     with local.cursor() as lcur:
         # 1) UPSERT del snapshot completo.
-        lcur.executemany(UPSERT_SQL, rows)
+        if sin_estado:
+            lcur.executemany(UPSERT_SQL, sin_estado)
+        if con_estado:
+            lcur.executemany(UPSERT_ESTADO_SQL, con_estado)
 
         # 2) Poda de fantasmas. Solo si el snapshot NO viene vacío, para no
         #    borrar la tabla local ante una respuesta vacía por error.
@@ -259,8 +319,9 @@ def reconcile(remote: psycopg.Connection, local: psycopg.Connection) -> int:
             pruned = lcur.rowcount
     local.commit()
     log.info(
-        "Reconcile: %d filas de la tribuna %s sincronizadas (podadas %d "
-        "no ingresadas)", len(rows), TRIBUNA_ID, pruned)
+        "Reconcile: %d filas de la tribuna %s sincronizadas (%d con ingreso "
+        "de origen externo; podadas %d no ingresadas)",
+        len(rows), TRIBUNA_ID, len(con_estado), pruned)
     return len(rows)
 
 
