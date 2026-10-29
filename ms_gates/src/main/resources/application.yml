@@ -14,6 +14,7 @@ app:
       username: ${REMOTE_DB_USERNAME:postgres}
       password: ${REMOTE_DB_PASSWORD:postgres}
       table: ${REMOTE_DB_TABLE:invitados}
+      visitor-table: ${REMOTE_DB_VISITOR_TABLE:visitante}
     catalog:
       url: jdbc:postgresql://${CATALOG_DB_HOST:localhost}:${CATALOG_DB_PORT:5432}/${CATALOG_DB_NAME:edc}
       username: ${CATALOG_DB_USERNAME:postgres}

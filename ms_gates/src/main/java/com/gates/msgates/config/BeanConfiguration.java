@@ -107,7 +107,7 @@ public class BeanConfiguration {
     public RemoteJdbcVisitorRepository remoteVisitorRepository(
             @Qualifier("remoteJdbcTemplate") JdbcTemplate jdbc,
             RemoteDbProperties props) {
-        return new RemoteJdbcVisitorRepository(jdbc, props.table());
+        return new RemoteJdbcVisitorRepository(jdbc, props.table(), props.visitorTable());
     }
 
     @Bean

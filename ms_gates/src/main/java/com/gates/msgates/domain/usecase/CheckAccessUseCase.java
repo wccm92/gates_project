@@ -36,55 +36,59 @@ public class CheckAccessUseCase {
     public void handle(ScanReading reading) {
         Credential credential = reading.credential();
         int idLector = reading.idLector();
+        String nombre = reading.nombre() != null ? reading.nombre() : "-";
         try {
             Optional<Visitante> found = repository.findByCredential(credential);
 
             if (found.isEmpty()) {
-                log.warn("[E001] documento no presente — credential={}", credential.value());
+                log.warn("[E001] documento no presente — credential={}, nombre={}",
+                        credential.value(), nombre);
                 throw new BusinessException("E001", "documento no presente");
             }
 
             Visitante visitante = found.get();
 
             if (visitante.isIngresado()) {
-                log.warn("[E002] documento ya ingresó — credential={}, estado='{}'",
-                        credential.value(), visitante.estado());
+                log.warn("[E002] documento ya ingresó — credential={}, nombre={}, estado='{}'",
+                        credential.value(), nombre, visitante.estado());
                 throw new BusinessException("E002", "documento ya ingresó");
             }
 
-            log.info("[S000] documento apto para ingresar — credential={}", credential.value());
+            log.info("[S000] documento apto para ingresar — credential={}, nombre={}",
+                    credential.value(), nombre);
 
             Optional<String> portId = readerCache.findPortId(idLector);
             if (portId.isEmpty()) {
-                log.warn("[E008] id_puerto no encontrado para lector — credential={}, id_lector={}",
-                        credential.value(), idLector);
+                log.warn("[E008] id_puerto no encontrado para lector — credential={}, nombre={}, id_lector={}",
+                        credential.value(), nombre, idLector);
                 throw new BusinessException("E008", "id_puerto no encontrado para lector");
             }
 
             int statusCode = notifier.notify(portId.get());
 
             if (statusCode == 200) {
-                log.info("[S001] notificación HTTP exitosa — credential={}, id_lector={}, status={}",
-                        credential.value(), idLector, statusCode);
+                log.info("[S001] notificación HTTP exitosa — credential={}, nombre={}, id_lector={}, status={}",
+                        credential.value(), nombre, idLector, statusCode);
                 try {
                     repository.updateEstado(visitante, "1");
-                    log.info("[S002] estado actualizado a '1' en DB — credential={}",
-                            credential.value());
-                    eventPublisher.publishEvent(new VisitorAdmittedEvent(credential, visitante, "1"));
+                    log.info("[S002] estado actualizado a '1' en DB — credential={}, nombre={}",
+                            credential.value(), nombre);
+                    eventPublisher.publishEvent(
+                            new VisitorAdmittedEvent(credential, visitante, "1", reading.nombre()));
                 } catch (RuntimeException e) {
-                    log.error("[E005] error al actualizar estado en DB — credential={}",
-                            credential.value(), e);
+                    log.error("[E005] error al actualizar estado en DB — credential={}, nombre={}",
+                            credential.value(), nombre, e);
                 }
             } else {
-                log.error("[E003] notificación HTTP fallida — credential={}, status={}",
-                        credential.value(), statusCode);
+                log.error("[E003] notificación HTTP fallida — credential={}, nombre={}, status={}",
+                        credential.value(), nombre, statusCode);
             }
 
         } catch (BusinessException e) {
             throw e;
         } catch (RuntimeException e) {
-            log.error("[E004] error inesperado en verificación de acceso — credential={}",
-                    credential.value(), e);
+            log.error("[E004] error inesperado en verificación de acceso — credential={}, nombre={}",
+                    credential.value(), nombre, e);
         }
     }
 }

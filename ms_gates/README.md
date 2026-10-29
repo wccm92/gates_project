@@ -211,8 +211,9 @@ src/main/java/com/gates/msgates/
 4. Each non-blank line ≤1 KiB becomes a `RawReading(payload, Instant.now())`.
 5. `ProcessReadingUseCase` calls `ReadingParser`, which splits on `|` or backtick and expects:
    - **token[0]** = `id_lector` (must parse as an integer),
-   - the first remaining token containing `\d{5,}` = the credential.
-   Result: `ScanReading(credential, idLector)`.
+   - the first remaining token that is a valid document (letters and digits, at least one digit) = the credential,
+   - the first other token made of two or more words with no digits = the holder's name (optional).
+   Result: `ScanReading(credential, idLector, nombre)`.
 6. On hit → `ConsoleCredentialPublisher.publish()` logs `INFO` and prints the numeric to stdout. Returns `Optional<ScanReading>`.
 7. On miss (blank, `<2` tokens, non-numeric token[0], or no credential) → `WARN` log, reading dropped, loop continues.
 8. If a `ScanReading` was produced, `CheckAccessUseCase.handle()` runs:
@@ -227,6 +228,7 @@ src/main/java/com/gates/msgates/
          - Local update fails → logs `[E005]`, `[S002]` is not emitted.
          - Local update succeeds → logs `[S002]` and publishes `VisitorAdmittedEvent` (remote sync happens inside the composite; failure there is `[E006]`, non-blocking).
 9. `VisitorAdmittedEvent` triggers the async alias updater (`[S003]`/`[S004]`/`[E007]`), off the reader thread.
+   It also triggers the async name updater: if the scan carried a name, it is written to the remote `visitante.nom_visitante`, only when that column is still empty (`[S005]`/`[E009]`).
 10. `BusinessException` is caught at the entrypoint — the reader loop is never interrupted.
 11. Any unexpected `RuntimeException` inside the use case is caught and logged as `[E004]`.
 12. On EOF or `IOException` → `SpringApplication.exit()` so the process supervisor can restart it.
@@ -287,6 +289,7 @@ All values are read from environment variables. Defaults are shown and apply whe
 | `REMOTE_DB_USERNAME` | `postgres` | User |
 | `REMOTE_DB_PASSWORD` | `postgres` | Password |
 | `REMOTE_DB_TABLE` | `invitados` | Visitor table name |
+| `REMOTE_DB_VISITOR_TABLE` | `visitante` | Visitor master table, where the name read from the card is stored (`nom_visitante`) |
 
 **Catalog DB** (reader → door mapping, loaded once at startup):
 
@@ -646,6 +649,7 @@ logging:
 | `S002` | `INFO` | `estado actualizado a '1' en DB` | local DB updated (emitted once by the use case); remote DB also updated unless `[E006]` appears |
 | `S003` | `INFO` | `alias con prefijo '0' ya ingresado` | the `"0"`-prefixed alias visitor was already admitted (async) |
 | `S004` | `INFO` | `alias con prefijo '0' actualizado` | the `"0"`-prefixed alias visitor was admitted too (async) |
+| `S005` | `INFO` | `nombre registrado en DB remota` | the name read from the card was written to the empty `visitante.nom_visitante` (async) |
 | `E001` | `WARN` | `documento no presente` | credential not found in `invitados` table |
 | `E002` | `WARN` | `documento ya ingresó` | credential found but `estado` is non-blank (already admitted) |
 | `E003` | `ERROR` | `notificación HTTP fallida` | external system responded non-200; no DB update performed |
@@ -654,6 +658,7 @@ logging:
 | `E006` | `ERROR` | `error al actualizar estado en DB remota` | local DB updated but remote DB sync failed (best-effort — does not block admission) |
 | `E007` | `ERROR` | `error al actualizar alias con prefijo '0'` | async alias update failed |
 | `E008` | `WARN` | `id_puerto no encontrado para lector` | `id_lector` not present in the reader cache; no HTTP notification sent |
+| `E009` | `ERROR` | `error al registrar nombre en DB remota` | async name update failed (best-effort — does not affect admission) |
 
 ---
 

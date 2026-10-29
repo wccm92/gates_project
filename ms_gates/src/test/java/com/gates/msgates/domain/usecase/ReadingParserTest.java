@@ -9,6 +9,7 @@ import java.time.Instant;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ReadingParserTest {
@@ -110,6 +111,54 @@ class ReadingParserTest {
         assertEquals("12HA12412", credencial("7|12HA12412"));
         assertEquals("12HA12412", credencial("7|12HA12412<<<<"));
         assertEquals("12HA12412", credencial("7|12ha12412"));
+    }
+
+    // ── Nombre del titular ──────────────────────────────────────────────────
+
+    private String nombre(String payload) {
+        return parse(payload).orElseThrow().nombre();
+    }
+
+    @Test
+    @DisplayName("Trama real de cédula: se toma el nombre")
+    void nombreDeCedula() {
+        assertEquals("HERRERA TORRES FELIPE ALBERTO",
+                nombre("6|1144140410|HERRERA TORRES FELIPE ALBERTO|"));
+        assertEquals("HERRERA TORRES FELIPE ALBERTO",
+                nombre("6`1144140410`HERRERA TORRES FELIPE ALBERTO`"));
+    }
+
+    @Test
+    @DisplayName("El nombre conserva acentos y eñes, y se normalizan espacios y mayúsculas")
+    void nombreNormalizado() {
+        assertEquals("MUÑOZ PEÑA JOSÉ ÁNGEL", nombre("6|1144140410|MUÑOZ PEÑA JOSÉ ÁNGEL|"));
+        assertEquals("HERRERA TORRES FELIPE", nombre("6|1144140410|  herrera   torres felipe |"));
+    }
+
+    @Test
+    @DisplayName("El nombre puede venir antes del documento")
+    void nombreAntesDelDocumento() {
+        assertEquals("HERRERA TORRES", nombre("6|HERRERA TORRES|1144140410|"));
+    }
+
+    @Test
+    @DisplayName("Sin nombre en la trama, el nombre queda nulo")
+    void sinNombre() {
+        assertNull(nombre("7|12345678"));
+        assertNull(nombre("7|AB123456<<<<<<<"));
+    }
+
+    @Test
+    @DisplayName("Etiquetas y metadatos no se toman por nombre")
+    void metadatosNoSonNombre() {
+        // "CARD" es una sola palabra y "DOOR-01" tiene dígitos.
+        assertNull(nombre("7|CARD|12345678|DOOR-01"));
+    }
+
+    @Test
+    @DisplayName("Con documento embebido, el nombre se sigue tomando del resto de la trama")
+    void nombreConDocumentoEmbebido() {
+        assertEquals("HERRERA TORRES FELIPE", nombre("7|CARD-ID:12345678|HERRERA TORRES FELIPE|"));
     }
 
     // ── Lo que NO debe tomarse por un documento ─────────────────────────────

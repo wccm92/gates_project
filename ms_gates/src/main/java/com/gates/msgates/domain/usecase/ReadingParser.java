@@ -29,6 +29,10 @@ import java.util.regex.Pattern;
  *       inside the tokens, which is what makes {@code 7|CARD-ID:12345678} still work.</li>
  * </ol>
  *
+ * <p>The holder's name, when the scan carries one, is picked up too (see {@link #findName}).
+ * It is informative only — logs and the cloud {@code visitante} table — and never takes
+ * part in the access decision.
+ *
  * <p>A match must contain at least one digit. Without that rule the first pass would
  * happily take a name or a label — {@code CREDENCIAL:12345678} would yield
  * {@code CREDENCIAL} — since both are just letters and digits.
@@ -40,6 +44,11 @@ public class ReadingParser {
     /** Letters and digits only: accents are excluded so a name can never match. */
     private static final Pattern DOCUMENT = Pattern.compile("[A-Z0-9]{5,}");
     private static final Pattern HAS_DIGIT = Pattern.compile("\\d");
+
+    /** Two or more words, the first starting with a letter. */
+    private static final Pattern NAME = Pattern.compile("\\p{L}\\S*(?: \\S+)+");
+    private static final Pattern WHITESPACE = Pattern.compile("\\s+");
+    private static final int MAX_NAME_LENGTH = 120;
 
     public Optional<ScanReading> parse(RawReading raw) {
         String payload = raw.payload();
@@ -67,7 +76,7 @@ public class ReadingParser {
         // Pass 1: a token that is, in full, a valid document.
         for (int i = 1; i < tokens.length; i++) {
             if (isDocument(cleaned[i])) {
-                return reading(cleaned[i], idLector);
+                return reading(cleaned[i], idLector, findName(tokens, i));
             }
         }
 
@@ -76,12 +85,37 @@ public class ReadingParser {
             Matcher matcher = DOCUMENT.matcher(cleaned[i]);
             while (matcher.find()) {
                 if (hasDigit(matcher.group())) {
-                    return reading(matcher.group(), idLector);
+                    return reading(matcher.group(), idLector, findName(tokens, i));
                 }
             }
         }
 
         return Optional.empty();
+    }
+
+    /**
+     * The holder's name: the first token, other than the reader ID and the document, made
+     * of two or more words with no digits ({@code HERRERA TORRES FELIPE ALBERTO}).
+     *
+     * <p>Two words, not one, so that a lone label such as {@code CARD} is never taken for a
+     * name. Characters other than letters are kept as the reader sent them: a scanner
+     * configured with a different keyboard layout may type {@code Ñ} as something else, and
+     * dropping the whole name over one odd character would lose more than it protects.
+     */
+    private String findName(String[] tokens, int documentIndex) {
+        for (int i = 1; i < tokens.length; i++) {
+            if (i == documentIndex) {
+                continue;
+            }
+            String candidate = WHITESPACE.matcher(tokens[i].trim()).replaceAll(" ")
+                    .toUpperCase(Locale.ROOT);
+            if (NAME.matcher(candidate).matches() && !hasDigit(candidate)) {
+                return candidate.length() > MAX_NAME_LENGTH
+                        ? candidate.substring(0, MAX_NAME_LENGTH).trim()
+                        : candidate;
+            }
+        }
+        return null;
     }
 
     /**
@@ -108,7 +142,7 @@ public class ReadingParser {
         return HAS_DIGIT.matcher(value).find();
     }
 
-    private Optional<ScanReading> reading(String value, int idLector) {
-        return Optional.of(new ScanReading(new Credential(value), idLector));
+    private Optional<ScanReading> reading(String value, int idLector, String nombre) {
+        return Optional.of(new ScanReading(new Credential(value), idLector, nombre));
     }
 }
